@@ -64,8 +64,62 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
+  findLocalQmdDir,
+  initLocalQmdDir,
+  setCliQmdDir,
+  getCliQmdDir,
+  getEffectiveQmdDir,
+  setQmdDirConfigLoader,
 } from "./store.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, setDefaultLlamaCpp, LlamaCpp, type ILLMSession, type RerankDocument, type Queryable, type QueryType, type LLM } from "./llm.js";
+import { RemoteLLM, loadRemoteConfig, saveRemoteConfig, clearRemoteConfig, isRemoteConfigured, getDefaultRemoteLLM, disposeDefaultRemoteLLM, withRemoteLLMSession, loadQmdDirConfig, saveQmdDirConfig, clearQmdDirConfig } from "./llm-remote.js";
+import type { LLMSessionOptions } from "./llm.js";
+
+// =============================================================================
+// LLM Backend Selection
+// =============================================================================
+
+// Global flag to force local mode (set via --local CLI flag)
+let forceLocalMode = false;
+
+/**
+ * Set whether to force local mode (ignoring remote config)
+ */
+function setForceLocalMode(force: boolean): void {
+  forceLocalMode = force;
+}
+
+/**
+ * Check if we should use remote LLM backend
+ */
+function shouldUseRemote(): boolean {
+  if (forceLocalMode) return false;
+  return isRemoteConfigured();
+}
+
+/**
+ * Execute a function with an LLM session (local or remote based on config)
+ */
+async function withLLMSessionAuto<T>(
+  fn: (session: ILLMSession) => Promise<T>,
+  options?: LLMSessionOptions
+): Promise<T> {
+  if (shouldUseRemote()) {
+    return withRemoteLLMSession(fn, options);
+  }
+  return withLLMSession(fn, options);
+}
+
+/**
+ * Dispose the appropriate LLM backend
+ */
+async function disposeDefaultLLMAuto(): Promise<void> {
+  if (shouldUseRemote()) {
+    await disposeDefaultRemoteLLM();
+  } else {
+    await disposeDefaultLlamaCpp();
+  }
+}
 import type { SearchResult, RankedResult } from "./store.js";
 import {
   formatSearchResults,
@@ -1511,8 +1565,12 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   const allChunks: ChunkItem[] = [];
   let multiChunkDocs = 0;
 
-  // Chunk all documents using actual token counts
-  process.stderr.write(`Chunking ${hashesToEmbed.length} documents by token count...\n`);
+  // Chunk all documents
+  // Use character-based chunking in remote mode (no local tokenizer available)
+  // Use token-based chunking in local mode (accurate token counts)
+  const useRemote = shouldUseRemote();
+  process.stderr.write(`Chunking ${hashesToEmbed.length} documents${useRemote ? ' (char-based)' : ' by token count'}...\n`);
+  
   for (const item of hashesToEmbed) {
     const encoder = new TextEncoder();
     const bodyBytes = encoder.encode(item.body).length;
@@ -1520,7 +1578,24 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
     const title = extractTitle(item.body, item.path);
     const displayName = item.path;
-    const chunks = await chunkDocumentByTokens(item.body);  // Uses actual tokenizer
+    
+    // Use char-based chunking for remote mode (no local model needed)
+    // Use token-based chunking for local mode (accurate but requires model)
+    let chunks: { text: string; pos: number; tokens: number }[];
+    if (useRemote) {
+      // Character-based chunking for remote mode
+      // Use smaller chunks (2000 chars ~500 tokens) to fit in remote server slots
+      const REMOTE_CHUNK_CHARS = 2000;
+      const REMOTE_OVERLAP_CHARS = 300;
+      const charChunks = chunkDocument(item.body, REMOTE_CHUNK_CHARS, REMOTE_OVERLAP_CHARS);
+      chunks = charChunks.map(c => ({
+        text: c.text,
+        pos: c.pos,
+        tokens: Math.ceil(c.text.length / 4), // Approximate token count
+      }));
+    } else {
+      chunks = await chunkDocumentByTokens(item.body);  // Uses actual tokenizer
+    }
 
     if (chunks.length > 1) multiChunkDocs++;
 
@@ -1559,7 +1634,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
   // Wrap all LLM embedding operations in a session for lifecycle management
   // Use 30 minute timeout for large collections
-  await withLLMSession(async (session) => {
+  await withLLMSessionAuto(async (session) => {
     // Get embedding dimensions from first chunk
     progress.indeterminate();
     const firstChunk = allChunks[0];
@@ -1591,19 +1666,26 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
         // Batch embed all texts at once
         const embeddings = await session.embedBatch(texts);
 
-        // Insert each embedding
-        for (let i = 0; i < batch.length; i++) {
-          const chunk = batch[i]!;
-          const embedding = embeddings[i];
+        // Insert all embeddings in a single transaction (avoids DB locking)
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          for (let i = 0; i < batch.length; i++) {
+            const chunk = batch[i]!;
+            const embedding = embeddings[i];
 
-          if (embedding) {
-            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
-            chunksEmbedded++;
-          } else {
-            errors++;
-            console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}${c.reset}`);
+            if (embedding) {
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+              chunksEmbedded++;
+            } else {
+              errors++;
+              console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}${c.reset}`);
+            }
+            bytesProcessed += chunk.bytes;
           }
-          bytesProcessed += chunk.bytes;
+          db.exec("COMMIT");
+        } catch (txErr) {
+          db.exec("ROLLBACK");
+          throw txErr;
         }
       } catch (err) {
         // If batch fails, try individual embeddings as fallback
@@ -1981,7 +2063,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   checkIndexHealth(db);
 
   // Wrap LLM operations in a session for lifecycle management
-  await withLLMSession(async (session) => {
+  await withLLMSessionAuto(async (session) => {
     // Expand query using structured output (no lexical for vector-only search)
     const queryables = await expandQueryStructured(query, false, opts.context, session);
 
@@ -2108,7 +2190,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   const hasStrongSignal = initialFts.length > 0 && topScore >= 0.85 && (topScore - secondScore) >= 0.15;
 
   // Wrap LLM operations in a session for lifecycle management
-  await withLLMSession(async (session) => {
+  await withLLMSessionAuto(async (session) => {
     let ftsQueries: string[] = [query];
     let vectorQueries: string[] = [query];
 
@@ -2298,6 +2380,8 @@ function parseCLI() {
         type: "boolean",
       },
       help: { type: "boolean", short: "h" },
+      index: { type: "string" },  // Custom index name
+      "qmd-dir": { type: "string" },  // Path to .qmd directory
       // Search options
       n: { type: "string" },
       "min-score": { type: "string" },
@@ -2316,6 +2400,11 @@ function parseCLI() {
       force: { type: "boolean", short: "f" },
       // Update options
       pull: { type: "boolean" },  // git pull before update
+      // Remote LLM options
+      "embed-url": { type: "string" },
+      "rerank-url": { type: "string" },
+      "generate-url": { type: "string" },
+      local: { type: "boolean" },  // Force local mode
       // Get options
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line
@@ -2325,6 +2414,15 @@ function parseCLI() {
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
   });
+
+  // Wire up the qmdDir config loader (to avoid circular imports)
+  setQmdDirConfigLoader(loadQmdDirConfig);
+
+  // Set CLI qmdDir if provided (highest priority)
+  const cliQmdDir = values["qmd-dir"] as string | undefined;
+  if (cliQmdDir) {
+    setCliQmdDir(cliQmdDir);
+  }
 
   // Select index name (default: "index")
   const indexName = values.index as string | undefined;
@@ -2376,6 +2474,9 @@ function showHelp(): void {
   console.log("  qmd context rm <path>         - Remove context");
   console.log("  qmd get <file>[:line] [-l N] [--from N]  - Get document (optionally from line, max N lines)");
   console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
+  console.log("  qmd init [path]               - Initialize .qmd at path and remember it");
+  console.log("  qmd init clear                - Clear saved path (use auto-discovery)");
+  console.log("  qmd where                     - Show index location and resolution priority");
   console.log("  qmd status                    - Show index status and collections");
   console.log("  qmd update [--pull]           - Re-index all collections (--pull: git pull first)");
   console.log("  qmd embed [-f]                - Create vector embeddings (800 tokens/chunk, 15% overlap)");
@@ -2384,8 +2485,12 @@ function showHelp(): void {
   console.log("  qmd vsearch <query>           - Vector similarity search");
   console.log("  qmd query <query>             - Combined search with query expansion + reranking");
   console.log("  qmd mcp                       - Start MCP server (for AI agent integration)");
+  console.log("  qmd remote set <embed> <rerank> <generate>  - Configure remote LLM endpoints");
+  console.log("  qmd remote status             - Show remote configuration and health");
+  console.log("  qmd remote clear              - Clear remote config (use local models)");
   console.log("");
   console.log("Global options:");
+  console.log("  --qmd-dir <path>           - Use .qmd directory at path (highest priority)");
   console.log("  --index <name>             - Use custom index name (default: index)");
   console.log("");
   console.log("Search options:");
@@ -2406,10 +2511,16 @@ function showHelp(): void {
   console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
   console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
   console.log("");
-  console.log("Models (auto-downloaded from HuggingFace):");
+  console.log("Remote LLM options:");
+  console.log("  --embed-url <url>          - Remote embedding server URL");
+  console.log("  --rerank-url <url>         - Remote reranking server URL");
+  console.log("  --generate-url <url>       - Remote generation server URL");
+  console.log("  --local                    - Force local mode (ignore remote config)");
+  console.log("");
+  console.log("Models (auto-downloaded from HuggingFace or served remotely):");
   console.log("  Embedding: embeddinggemma-300M-Q8_0");
   console.log("  Reranking: qwen3-reranker-0.6b-q8_0");
-  console.log("  Generation: Qwen3-0.6B-Q8_0");
+  console.log("  Generation: qmd-query-expansion-1.7B");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
 }
@@ -2417,6 +2528,11 @@ function showHelp(): void {
 // Main CLI - only run if this is the main module
 if (import.meta.main) {
   const cli = parseCLI();
+
+  // Handle --local flag to force local mode
+  if (cli.values.local) {
+    setForceLocalMode(true);
+  }
 
   if (!cli.command || cli.values.help) {
     showHelp();
@@ -2629,6 +2745,159 @@ if (import.meta.main) {
       break;
     }
 
+    case "remote": {
+      const subcommand = cli.args[0];
+      if (!subcommand) {
+        console.error("Usage: qmd remote <set|status|clear>");
+        console.error("");
+        console.error("Commands:");
+        console.error("  qmd remote set <embed-url> <rerank-url> <generate-url>");
+        console.error("  qmd remote set --embed-url <url> --rerank-url <url> --generate-url <url>");
+        console.error("  qmd remote status       - Show current remote configuration");
+        console.error("  qmd remote clear        - Clear remote config (use local mode)");
+        process.exit(1);
+      }
+
+      switch (subcommand) {
+        case "set": {
+          // Support both positional args and flags
+          let embedUrl = cli.values["embed-url"] as string | undefined;
+          let rerankUrl = cli.values["rerank-url"] as string | undefined;
+          let generateUrl = cli.values["generate-url"] as string | undefined;
+
+          // Positional args: qmd remote set <embed> <rerank> <generate>
+          if (cli.args.length >= 4) {
+            embedUrl = cli.args[1];
+            rerankUrl = cli.args[2];
+            generateUrl = cli.args[3];
+          } else if (cli.args.length === 2 && cli.args[1]) {
+            // Single URL for all endpoints
+            embedUrl = cli.args[1];
+            rerankUrl = cli.args[1];
+            generateUrl = cli.args[1];
+          }
+
+          if (!embedUrl && !rerankUrl && !generateUrl) {
+            console.error("Usage: qmd remote set <embed-url> <rerank-url> <generate-url>");
+            console.error("   or: qmd remote set --embed-url <url> --rerank-url <url> --generate-url <url>");
+            process.exit(1);
+          }
+
+          // Load existing config and merge
+          const existingConfig = loadRemoteConfig();
+          const newConfig = {
+            embedUrl: embedUrl || existingConfig.embedUrl,
+            rerankUrl: rerankUrl || existingConfig.rerankUrl,
+            generateUrl: generateUrl || existingConfig.generateUrl,
+          };
+
+          saveRemoteConfig(newConfig);
+          console.log(`${c.green}✓${c.reset} Remote configuration saved`);
+          console.log(`${c.dim}Embed:${c.reset}    ${newConfig.embedUrl || "(not set)"}`);
+          console.log(`${c.dim}Rerank:${c.reset}   ${newConfig.rerankUrl || "(not set)"}`);
+          console.log(`${c.dim}Generate:${c.reset} ${newConfig.generateUrl || "(not set)"}`);
+          break;
+        }
+
+        case "status": {
+          const config = loadRemoteConfig();
+          if (!config.embedUrl && !config.rerankUrl && !config.generateUrl) {
+            console.log(`${c.dim}Remote mode: disabled (using local models)${c.reset}`);
+          } else {
+            console.log(`${c.bold}Remote Configuration${c.reset}\n`);
+            console.log(`${c.dim}Embed:${c.reset}    ${config.embedUrl || "(not set)"}`);
+            console.log(`${c.dim}Rerank:${c.reset}   ${config.rerankUrl || "(not set)"}`);
+            console.log(`${c.dim}Generate:${c.reset} ${config.generateUrl || "(not set)"}`);
+
+            // Check health of endpoints
+            console.log(`\n${c.dim}Checking endpoint health...${c.reset}`);
+            const remote = new RemoteLLM(config);
+            const health = await remote.checkHealth();
+            console.log(`${c.dim}Embed:${c.reset}    ${health.embed ? `${c.green}✓ healthy${c.reset}` : `${c.yellow}✗ unreachable${c.reset}`}`);
+            console.log(`${c.dim}Rerank:${c.reset}   ${health.rerank ? `${c.green}✓ healthy${c.reset}` : `${c.yellow}✗ unreachable${c.reset}`}`);
+            console.log(`${c.dim}Generate:${c.reset} ${health.generate ? `${c.green}✓ healthy${c.reset}` : `${c.yellow}✗ unreachable${c.reset}`}`);
+          }
+          break;
+        }
+
+        case "clear": {
+          clearRemoteConfig();
+          console.log(`${c.green}✓${c.reset} Remote configuration cleared`);
+          console.log(`${c.dim}Now using local models${c.reset}`);
+          break;
+        }
+
+        default:
+          console.error(`Unknown subcommand: ${subcommand}`);
+          console.error("Available: set, status, clear");
+          process.exit(1);
+      }
+      break;
+    }
+
+    case "init": {
+      const subcommand = cli.args[0];
+      
+      // Handle "init clear" to remove saved path
+      if (subcommand === "clear") {
+        clearQmdDirConfig();
+        console.log(`${c.green}✓${c.reset} Cleared saved .qmd directory path`);
+        console.log(`${c.dim}Will now auto-discover from current directory${c.reset}`);
+        break;
+      }
+      
+      // Initialize or remember a .qmd directory
+      const targetDir = subcommand ? resolve(subcommand) : getPwd();
+      const qmdDir = resolve(targetDir, ".qmd");
+      
+      // Check if .qmd already exists at target
+      const existingQmdDir = findLocalQmdDir(targetDir);
+      if (existingQmdDir && existingQmdDir === qmdDir) {
+        // Already exists - just save it to config
+        saveQmdDirConfig(qmdDir);
+        console.log(`${c.green}✓${c.reset} Saved .qmd directory: ${qmdDir}`);
+        console.log(`${c.dim}Index location: ${resolve(qmdDir, "index.sqlite")}${c.reset}`);
+        console.log(`\n${c.dim}QMD will now use this directory from anywhere.${c.reset}`);
+        break;
+      }
+      
+      // Create new .qmd directory
+      const newQmdDir = initLocalQmdDir(targetDir);
+      saveQmdDirConfig(newQmdDir);
+      console.log(`${c.green}✓${c.reset} Initialized .qmd directory at ${newQmdDir}`);
+      console.log(`${c.dim}Index will be stored at: ${resolve(newQmdDir, "index.sqlite")}${c.reset}`);
+      console.log(`\n${c.dim}QMD will now use this directory from anywhere.${c.reset}`);
+      console.log(`${c.dim}Run 'qmd init clear' to reset to auto-discovery mode.${c.reset}`);
+      break;
+    }
+
+    case "where": {
+      // Show where the index is stored and why
+      const cliQmdDir = getCliQmdDir();
+      const savedQmdDir = loadQmdDirConfig();
+      const autoQmdDir = findLocalQmdDir();
+      const effectiveDir = getEffectiveQmdDir();
+      const dbPath = getDefaultDbPath(cli.indexName);
+      
+      console.log(`${c.bold}QMD Index Location${c.reset}\n`);
+      console.log(`${c.dim}Database:${c.reset}  ${dbPath}`);
+      
+      if (effectiveDir) {
+        console.log(`${c.dim}Directory:${c.reset} ${effectiveDir}`);
+      }
+      
+      console.log(`\n${c.bold}Resolution Priority:${c.reset}`);
+      console.log(`  1. CLI flag (--qmd-dir):   ${cliQmdDir ? `${c.green}${cliQmdDir}${c.reset} ${c.dim}(active)${c.reset}` : `${c.dim}not set${c.reset}`}`);
+      console.log(`  2. Saved config:           ${savedQmdDir ? `${savedQmdDir}${cliQmdDir ? '' : ` ${c.dim}(active)${c.reset}`}` : `${c.dim}not set${c.reset}`}`);
+      console.log(`  3. Auto-discover:          ${autoQmdDir ? `${autoQmdDir}${!cliQmdDir && !savedQmdDir ? ` ${c.dim}(active)${c.reset}` : ''}` : `${c.dim}none found${c.reset}`}`);
+      
+      if (!effectiveDir) {
+        console.log(`\n${c.yellow}Using global index${c.reset} (not portable)`);
+        console.log(`${c.dim}Run 'qmd init /path/to/data' to create a portable index${c.reset}`);
+      }
+      break;
+    }
+
     case "cleanup": {
       const db = getDb();
 
@@ -2665,7 +2934,7 @@ if (import.meta.main) {
   }
 
   if (cli.command !== "mcp") {
-    await disposeDefaultLlamaCpp();
+    await disposeDefaultLLMAuto();
     process.exit(0);
   }
 

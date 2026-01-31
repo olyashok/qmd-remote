@@ -238,6 +238,117 @@ export function enableProductionMode(): void {
   _productionMode = true;
 }
 
+/**
+ * Find a local .qmd directory by searching current directory and parents.
+ * Returns the path to the .qmd directory if found, null otherwise.
+ */
+export function findLocalQmdDir(startDir?: string): string | null {
+  let dir = startDir || getPwd();
+  const root = resolve("/");
+  
+  while (dir !== root) {
+    const qmdDir = resolve(dir, ".qmd");
+    try {
+      const stat = Bun.file(qmdDir).size; // Check if exists
+      // Check if it's a directory by trying to read a file in it
+      const testPath = resolve(qmdDir, ".qmd-root");
+      if (existsSync(qmdDir)) {
+        return qmdDir;
+      }
+    } catch {
+      // Directory doesn't exist, continue searching
+    }
+    
+    const parent = resolve(dir, "..");
+    if (parent === dir) break; // Reached root
+    dir = parent;
+  }
+  
+  return null;
+}
+
+/**
+ * Check if a path exists (file or directory)
+ */
+function existsSync(path: string): boolean {
+  try {
+    const file = Bun.file(path);
+    // For directories, we need a different approach
+    const result = Bun.spawnSync(["test", "-e", path]);
+    return result.exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Initialize a local .qmd directory in the specified path.
+ * Creates the directory and returns the path to the index file.
+ */
+export function initLocalQmdDir(targetDir?: string): string {
+  const dir = targetDir || getPwd();
+  const qmdDir = resolve(dir, ".qmd");
+  
+  try {
+    Bun.spawnSync(["mkdir", "-p", qmdDir]);
+  } catch {
+    throw new Error(`Failed to create .qmd directory at ${qmdDir}`);
+  }
+  
+  return qmdDir;
+}
+
+// Global variable to store CLI-provided qmdDir (highest priority)
+let _cliQmdDir: string | null = null;
+
+/**
+ * Set the qmdDir from CLI flag (highest priority)
+ */
+export function setCliQmdDir(qmdDir: string | null): void {
+  _cliQmdDir = qmdDir;
+}
+
+/**
+ * Get the qmdDir from CLI flag
+ */
+export function getCliQmdDir(): string | null {
+  return _cliQmdDir;
+}
+
+// Import will be resolved at runtime to avoid circular dependency
+let _loadQmdDirConfig: (() => string | null) | null = null;
+
+/**
+ * Set the config loader function (to avoid circular imports)
+ */
+export function setQmdDirConfigLoader(loader: () => string | null): void {
+  _loadQmdDirConfig = loader;
+}
+
+/**
+ * Get the effective qmdDir with priority:
+ * 1. CLI flag (--qmd-dir)
+ * 2. Saved config (~/.cache/qmd/config.json)
+ * 3. Auto-discover (search upward for .qmd)
+ */
+export function getEffectiveQmdDir(): string | null {
+  // 1. CLI flag (highest priority)
+  if (_cliQmdDir) {
+    return _cliQmdDir;
+  }
+  
+  // 2. Saved config
+  if (_loadQmdDirConfig) {
+    const configDir = _loadQmdDirConfig();
+    if (configDir && existsSync(configDir)) {
+      return configDir;
+    }
+  }
+  
+  // 3. Auto-discover
+  return findLocalQmdDir();
+}
+
 export function getDefaultDbPath(indexName: string = "index"): string {
   // Always allow override via INDEX_PATH (for testing)
   if (Bun.env.INDEX_PATH) {
@@ -252,6 +363,13 @@ export function getDefaultDbPath(indexName: string = "index"): string {
     );
   }
 
+  // Check for qmdDir with priority: CLI > config > auto-discover
+  const qmdDir = getEffectiveQmdDir();
+  if (qmdDir) {
+    return resolve(qmdDir, `${indexName}.sqlite`);
+  }
+
+  // Fall back to global cache
   const cacheDir = Bun.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
   const qmdCacheDir = resolve(cacheDir, "qmd");
   try { Bun.spawnSync(["mkdir", "-p", qmdCacheDir]); } catch { }
