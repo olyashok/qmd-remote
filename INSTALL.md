@@ -19,7 +19,8 @@ source ~/.bashrc  # or source ~/.zshrc on macOS
 ### 2. Clone and Install QMD
 
 ```bash
-# Clone the repository
+# Clone the repository to home folder
+cd ~
 git clone https://github.com/olyashok/qmd-remote.git
 cd qmd-remote
 
@@ -32,10 +33,10 @@ chmod +x qmd
 # Add to PATH (choose one method)
 
 # Option A: Symlink to /usr/local/bin (requires sudo)
-sudo ln -sf "$(pwd)/qmd" /usr/local/bin/qmd
+sudo ln -sf ~/qmd-remote/qmd /usr/local/bin/qmd
 
-# Option B: Add to ~/.bashrc or ~/.zshrc (no sudo)
-echo "export PATH=\"\$PATH:$(pwd)\"" >> ~/.bashrc
+# Option B: Add to ~/.bashrc or ~/.zshrc (no sudo, recommended)
+echo 'export PATH="$PATH:$HOME/qmd-remote"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
