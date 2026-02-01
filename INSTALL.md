@@ -54,18 +54,19 @@ qmd remote set \
 qmd remote status
 ```
 
-Expected output:
-```
-Remote Configuration
+**Using LiteLLM for query expansion (generate):** Point the generate endpoint at your LiteLLM proxy and set the model name:
 
-Embed:    http://192.168.5.163:8081
-Rerank:   http://192.168.5.163:8082
-Generate: http://192.168.5.163:8083
+```bash
+# Point generate at LiteLLM (keep embed/rerank on llama.cpp servers)
+# Use the server IP, not localhost
+qmd remote set \
+  http://192.168.5.163:8081 \
+  http://192.168.5.163:8082 \
+  http://192.168.5.163:4000
 
-Checking endpoint health...
-Embed:    ✓ healthy
-Rerank:   ✓ healthy
-Generate: ✓ healthy
+# Set the fast model for expansion (required for LiteLLM)
+qmd remote set --generate-model fast
+# or: gpt-4o-mini, ollama/llama3, etc.
 ```
 
 ### 4. Configure Shared Data Directory (if available)
