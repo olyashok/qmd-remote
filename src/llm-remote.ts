@@ -30,9 +30,10 @@ import type {
 // =============================================================================
 
 export type RemoteLLMConfig = {
-  embedUrl?: string;    // e.g. "http://192.168.1.100:8081"
-  rerankUrl?: string;   // e.g. "http://192.168.1.100:8082"
-  generateUrl?: string; // e.g. "http://192.168.1.100:8083"
+  embedUrl?: string;     // e.g. "http://192.168.1.100:8081"
+  rerankUrl?: string;    // e.g. "http://192.168.1.100:8082"
+  generateUrl?: string;  // e.g. "http://192.168.1.100:8083" or "http://localhost:4000" (LiteLLM)
+  generateModel?: string; // e.g. "gpt-4o-mini" or "ollama/llama3" - required for LiteLLM, optional for llama.cpp
 };
 
 // Config file path
@@ -182,13 +183,15 @@ export class RemoteLLM implements LLM {
   private embedUrl: string | null;
   private rerankUrl: string | null;
   private generateUrl: string | null;
+  private generateModel: string | null;
 
   constructor(config: RemoteLLMConfig = {}) {
     // Load from saved config, then override with explicit config
     const savedConfig = loadRemoteConfig();
-    this.embedUrl = config.embedUrl || savedConfig.embedUrl || null;
-    this.rerankUrl = config.rerankUrl || savedConfig.rerankUrl || null;
-    this.generateUrl = config.generateUrl || savedConfig.generateUrl || null;
+    this.embedUrl = config.embedUrl ?? savedConfig.embedUrl ?? null;
+    this.rerankUrl = config.rerankUrl ?? savedConfig.rerankUrl ?? null;
+    this.generateUrl = config.generateUrl ?? savedConfig.generateUrl ?? null;
+    this.generateModel = config.generateModel ?? savedConfig.generateModel ?? null;
   }
 
   /**
@@ -307,14 +310,18 @@ export class RemoteLLM implements LLM {
     }
 
     try {
+      const body: Record<string, unknown> = {
+        prompt,
+        max_tokens: options.maxTokens ?? 150,
+        temperature: options.temperature ?? 0,
+      };
+      if (this.generateModel) {
+        body.model = this.generateModel;
+      }
       const response = await fetch(`${this.generateUrl}/v1/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          max_tokens: options.maxTokens ?? 150,
-          temperature: options.temperature ?? 0,
-        }),
+        body: JSON.stringify(body),
       });
 
       if (!response.ok) {
@@ -462,6 +469,54 @@ Final Output:`;
       };
     }
 
+    // If we have more than 10 documents, batch them to avoid overwhelming the server
+    const BATCH_SIZE = 10;
+    if (documents.length > BATCH_SIZE) {
+      try {
+        const allResults: RerankDocumentResult[] = [];
+        let modelName = "remote-rerank";
+
+        // Process in batches
+        for (let i = 0; i < documents.length; i += BATCH_SIZE) {
+          const batch = documents.slice(i, i + BATCH_SIZE);
+          const batchResult = await this.rerankBatch(query, batch, i);
+          allResults.push(...batchResult.results);
+          modelName = batchResult.model;
+        }
+
+        // Sort all results by score descending
+        allResults.sort((a, b) => b.score - a.score);
+
+        return {
+          results: allResults,
+          model: modelName,
+        };
+      } catch (error) {
+        console.error("Batch rerank error:", error);
+        // Fallback
+        return {
+          results: documents.map((doc, index) => ({
+            file: doc.file,
+            score: 1 - (index * 0.1),
+            index,
+          })),
+          model: "rerank-fallback",
+        };
+      }
+    }
+
+    // Single batch - use existing logic
+    return this.rerankBatch(query, documents, 0);
+  }
+
+  /**
+   * Rerank a single batch of documents
+   */
+  private async rerankBatch(
+    query: string,
+    documents: RerankDocument[],
+    indexOffset: number
+  ): Promise<RerankResult> {
     try {
       const texts = documents.map(doc => doc.text);
 
@@ -477,6 +532,13 @@ Final Output:`;
 
       if (!response.ok) {
         console.error(`Rerank request failed: ${response.status} ${response.statusText}`);
+        // Try to get error details from response body
+        try {
+          const errorText = await response.text();
+          console.error(`Rerank error details: ${errorText}`);
+        } catch (e) {
+          // Ignore if we can't read the error body
+        }
         throw new Error("Rerank request failed");
       }
 
@@ -485,11 +547,11 @@ Final Output:`;
         model: string;
       };
 
-      // Map results back to our format
+      // Map results back to our format (with adjusted indices)
       const results: RerankDocumentResult[] = data.results.map(item => ({
         file: documents[item.index].file,
         score: item.relevance_score,
-        index: item.index,
+        index: indexOffset + item.index,
       }));
 
       // Sort by score descending
@@ -500,13 +562,13 @@ Final Output:`;
         model: data.model || "remote-rerank",
       };
     } catch (error) {
-      console.error("Rerank error:", error);
+      console.error("Rerank batch error:", error);
       // Return documents in original order with default scores
       return {
         results: documents.map((doc, index) => ({
           file: doc.file,
           score: 1 - (index * 0.1),
-          index,
+          index: indexOffset + index,
         })),
         model: "rerank-fallback",
       };
@@ -553,6 +615,7 @@ Final Output:`;
       embedUrl: this.embedUrl || undefined,
       rerankUrl: this.rerankUrl || undefined,
       generateUrl: this.generateUrl || undefined,
+      generateModel: this.generateModel || undefined,
     };
   }
 }

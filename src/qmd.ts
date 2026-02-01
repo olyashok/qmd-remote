@@ -295,7 +295,7 @@ async function rerank(query: string, documents: { file: string; text: string }[]
 
   const rerankDocs: RerankDocument[] = documents.map((doc) => ({
     file: doc.file,
-    text: doc.text.slice(0, 4000), // Truncate to context limit
+    text: doc.text.slice(0, 2000), // Truncate to avoid context overflow
   }));
 
   const result = session
@@ -2405,6 +2405,7 @@ function parseCLI() {
       "embed-url": { type: "string" },
       "rerank-url": { type: "string" },
       "generate-url": { type: "string" },
+      "generate-model": { type: "string" },
       local: { type: "boolean" },  // Force local mode
       // Get options
       l: { type: "string" },  // max lines
@@ -2518,7 +2519,8 @@ function showHelp(): void {
   console.log("Remote LLM options:");
   console.log("  --embed-url <url>          - Remote embedding server URL");
   console.log("  --rerank-url <url>         - Remote reranking server URL");
-  console.log("  --generate-url <url>       - Remote generation server URL");
+  console.log("  --generate-url <url>       - Remote generation server URL (LiteLLM supported)");
+  console.log("  --generate-model <model>   - Model for generate (required for LiteLLM: gpt-4o-mini, ollama/llama3)");
   console.log("  --local                    - Force local mode (ignore remote config)");
   console.log("");
   console.log("Models (auto-downloaded from HuggingFace or served remotely):");
@@ -2768,8 +2770,9 @@ if (import.meta.main) {
           let embedUrl = cli.values["embed-url"] as string | undefined;
           let rerankUrl = cli.values["rerank-url"] as string | undefined;
           let generateUrl = cli.values["generate-url"] as string | undefined;
+          const generateModel = cli.values["generate-model"] as string | undefined;
 
-          // Positional args: qmd remote set <embed> <rerank> <generate>
+          // Positional args: qmd remote set <embed> <rerank> <generate> [generate-model]
           if (cli.args.length >= 4) {
             embedUrl = cli.args[1];
             rerankUrl = cli.args[2];
@@ -2781,18 +2784,20 @@ if (import.meta.main) {
             generateUrl = cli.args[1];
           }
 
-          if (!embedUrl && !rerankUrl && !generateUrl) {
-            console.error("Usage: qmd remote set <embed-url> <rerank-url> <generate-url>");
-            console.error("   or: qmd remote set --embed-url <url> --rerank-url <url> --generate-url <url>");
+          if (!embedUrl && !rerankUrl && !generateUrl && !generateModel) {
+            console.error("Usage: qmd remote set <embed-url> <rerank-url> <generate-url> [generate-model]");
+            console.error("   or: qmd remote set --embed-url <url> --rerank-url <url> --generate-url <url> [--generate-model <model>]");
+            console.error("   or: qmd remote set --generate-model <model>  (LiteLLM: e.g. gpt-4o-mini, ollama/llama3)");
             process.exit(1);
           }
 
           // Load existing config and merge
           const existingConfig = loadRemoteConfig();
           const newConfig = {
-            embedUrl: embedUrl || existingConfig.embedUrl,
-            rerankUrl: rerankUrl || existingConfig.rerankUrl,
-            generateUrl: generateUrl || existingConfig.generateUrl,
+            embedUrl: embedUrl ?? existingConfig.embedUrl,
+            rerankUrl: rerankUrl ?? existingConfig.rerankUrl,
+            generateUrl: generateUrl ?? existingConfig.generateUrl,
+            generateModel: generateModel ?? existingConfig.generateModel,
           };
 
           saveRemoteConfig(newConfig);
@@ -2800,6 +2805,9 @@ if (import.meta.main) {
           console.log(`${c.dim}Embed:${c.reset}    ${newConfig.embedUrl || "(not set)"}`);
           console.log(`${c.dim}Rerank:${c.reset}   ${newConfig.rerankUrl || "(not set)"}`);
           console.log(`${c.dim}Generate:${c.reset} ${newConfig.generateUrl || "(not set)"}`);
+          if (newConfig.generateModel) {
+            console.log(`${c.dim}Generate model:${c.reset} ${newConfig.generateModel}`);
+          }
           break;
         }
 
@@ -2812,6 +2820,9 @@ if (import.meta.main) {
             console.log(`${c.dim}Embed:${c.reset}    ${config.embedUrl || "(not set)"}`);
             console.log(`${c.dim}Rerank:${c.reset}   ${config.rerankUrl || "(not set)"}`);
             console.log(`${c.dim}Generate:${c.reset} ${config.generateUrl || "(not set)"}`);
+            if (config.generateModel) {
+              console.log(`${c.dim}Generate model:${c.reset} ${config.generateModel}`);
+            }
 
             // Check health of endpoints
             console.log(`\n${c.dim}Checking endpoint health...${c.reset}`);
