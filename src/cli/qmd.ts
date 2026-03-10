@@ -85,6 +85,14 @@ import {
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import { RemoteLLM, loadRemoteConfig, saveRemoteConfig, clearRemoteConfig, isRemoteConfigured, getDefaultRemoteLLM, disposeDefaultRemoteLLM, withRemoteLLMSession, loadQmdDirConfig, saveQmdDirConfig, clearQmdDirConfig } from "../llm-remote.js";
+import { loadMirrorConfig, saveMirrorConfig, clearMirrorConfig, syncMirror, isMirrorStale, mirrorAgeString, type MirrorConfig } from "../mirror.js";
+
+/**
+ * Set whether to force local mode (ignoring remote config)
+ */
+function setForceLocalMode(force: boolean): void {
+  forceLocalMode = force;
+}
 import {
   formatSearchResults,
   formatDocuments,
@@ -2707,6 +2715,12 @@ function showHelp(): void {
   console.log("  - `qmd --skill` is kept as an alias for `qmd skill show`.");
   console.log("  - Advanced: `qmd mcp --http ...` and `qmd mcp --http --daemon` are optional for custom transports.");
   console.log("");
+  console.log("Mirror (cached local copies of remote indexes):");
+  console.log("  qmd mirror <ssh-src> [path]   - Set up local cache of remote .qmd index");
+  console.log("  qmd mirror sync               - Re-sync from recorded source");
+  console.log("  qmd mirror status             - Show mirror source, last sync, staleness");
+  console.log("  qmd mirror clear              - Remove mirror tracking (keep local copy)");
+  console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
   console.log("  --local                    - Force local LLM mode (ignore remote config)");
@@ -3221,6 +3235,188 @@ if (isMain) {
           console.error(`Unknown subcommand: ${subcommand}`);
           console.error("Run 'qmd skill help' for usage");
           process.exit(1);
+      }
+      break;
+    }
+
+    case "mirror": {
+      const sub = cli.args[0];
+
+      // ── mirror status (no args, or explicit "status") ─────────────────────
+      if (!sub || sub === "status") {
+        const qmdDir = getEffectiveQmdDir();
+        if (!qmdDir) {
+          console.error("No .qmd directory configured. Run 'qmd init <path>' first.");
+          process.exit(1);
+        }
+        const mirror = loadMirrorConfig(qmdDir);
+        if (!mirror) {
+          console.log(`${c.dim}No mirror configured for this index.${c.reset}`);
+          console.log(`${c.dim}Run 'qmd mirror <user@host:/path/.qmd>' to set one up.${c.reset}`);
+        } else {
+          const stale = isMirrorStale(mirror);
+          console.log(`${c.bold}Mirror Status${c.reset}\n`);
+          console.log(`${c.dim}Source:${c.reset}    ${mirror.source}`);
+          console.log(`${c.dim}Local:${c.reset}     ${mirror.localPath}`);
+          console.log(`${c.dim}Last sync:${c.reset} ${mirror.lastSync ? `${mirror.lastSync} (${mirrorAgeString(mirror)})` : "never"}`);
+          console.log(`${c.dim}Status:${c.reset}    ${stale ? `${c.yellow}stale — run 'qmd mirror sync'${c.reset}` : `${c.green}fresh${c.reset}`}`);
+        }
+        break;
+      }
+
+      // ── mirror sync ────────────────────────────────────────────────────────
+      if (sub === "sync") {
+        const qmdDir = getEffectiveQmdDir();
+        if (!qmdDir) {
+          console.error("No .qmd directory configured. Run 'qmd init <path>' first.");
+          process.exit(1);
+        }
+        const mirror = loadMirrorConfig(qmdDir);
+        if (!mirror) {
+          console.error("No mirror configured. Run 'qmd mirror <user@host:/path/.qmd>' first.");
+          process.exit(1);
+        }
+        console.log(`Syncing from ${c.bold}${mirror.source}${c.reset} ...`);
+        try {
+          await syncMirror(qmdDir, mirror, {
+            onProgress: (line) => process.stderr.write(line),
+          });
+          console.log(`${c.green}✓${c.reset} Sync complete (${mirror.lastSync})`);
+        } catch (e: any) {
+          console.error(`${c.yellow}✗${c.reset} Sync failed: ${e.message}`);
+          process.exit(1);
+        }
+        break;
+      }
+
+      // ── mirror clear ───────────────────────────────────────────────────────
+      if (sub === "clear") {
+        const qmdDir = getEffectiveQmdDir();
+        if (!qmdDir) {
+          console.error("No .qmd directory configured.");
+          process.exit(1);
+        }
+        clearMirrorConfig(qmdDir);
+        console.log(`${c.green}✓${c.reset} Mirror tracking removed (local copy kept)`);
+        break;
+      }
+
+      // ── mirror <ssh-source> [local-path] ───────────────────────────────────
+      // sub is the ssh source, e.g. "root@192.168.5.163:/root/.openclaw/agents/shape-main/.qmd"
+      {
+        const source = sub;
+        const localArg = cli.args[1];
+
+        // Derive a default local path from the source if not given
+        // e.g. ~/.cache/qmd/mirrors/shape-main/
+        let localPath: string;
+        if (localArg) {
+          localPath = resolve(localArg);
+          // If given a parent dir (not ending in .qmd), append .qmd
+          if (!localPath.endsWith(".qmd")) {
+            localPath = resolve(localPath, ".qmd");
+          }
+        } else {
+          // Slug from last component of source path (strip .qmd suffix for readability)
+          const srcPath = source.includes(":") ? source.split(":")[1]! : source;
+          const parts = srcPath.replace(/\/\.qmd\/?$/, "").split("/").filter(Boolean);
+          const slug = parts[parts.length - 1] || "mirror";
+          localPath = resolve(homedir(), ".cache", "qmd", "mirrors", slug, ".qmd");
+        }
+
+        // Create local dir
+        Bun.spawnSync(["mkdir", "-p", localPath]);
+
+        const mirrorConfig: MirrorConfig = {
+          source,
+          localPath,
+          lastSync: null,
+        };
+
+        // Save tracking file before sync so it's in place
+        saveMirrorConfig(localPath, mirrorConfig);
+
+        // Do initial sync
+        console.log(`Syncing ${c.bold}${source}${c.reset} → ${localPath} ...`);
+        console.log(`${c.dim}(this may take a while on first run)${c.reset}`);
+        try {
+          await syncMirror(localPath, mirrorConfig, {
+            onProgress: (line) => process.stderr.write(line),
+          });
+        } catch (e: any) {
+          console.error(`${c.yellow}✗${c.reset} Sync failed: ${e.message}`);
+          process.exit(1);
+        }
+
+        // Point qmd at the new local copy
+        saveQmdDirConfig(localPath);
+        setCliQmdDir(null); // clear any CLI override so saved config is active
+
+        console.log(`${c.green}✓${c.reset} Mirror ready at ${localPath}`);
+        console.log(`${c.dim}Index is now active. Run 'qmd mirror sync' to refresh.${c.reset}`);
+      }
+      break;
+    }
+
+    case "init": {
+      const subcommand = cli.args[0];
+
+      // Handle "init clear" to remove saved path
+      if (subcommand === "clear") {
+        clearQmdDirConfig();
+        console.log(`${c.green}✓${c.reset} Cleared saved .qmd directory path`);
+        console.log(`${c.dim}Will now auto-discover from current directory${c.reset}`);
+        break;
+      }
+      
+      // Initialize or remember a .qmd directory
+      const targetDir = subcommand ? resolve(subcommand) : getPwd();
+      const qmdDir = resolve(targetDir, ".qmd");
+      
+      // Check if .qmd already exists at target
+      const existingQmdDir = findLocalQmdDir(targetDir);
+      if (existingQmdDir && existingQmdDir === qmdDir) {
+        // Already exists - just save it to config
+        saveQmdDirConfig(qmdDir);
+        console.log(`${c.green}✓${c.reset} Saved .qmd directory: ${qmdDir}`);
+        console.log(`${c.dim}Index location: ${resolve(qmdDir, "index.sqlite")}${c.reset}`);
+        console.log(`\n${c.dim}QMD will now use this directory from anywhere.${c.reset}`);
+        break;
+      }
+      
+      // Create new .qmd directory
+      const newQmdDir = initLocalQmdDir(targetDir);
+      saveQmdDirConfig(newQmdDir);
+      console.log(`${c.green}✓${c.reset} Initialized .qmd directory at ${newQmdDir}`);
+      console.log(`${c.dim}Index will be stored at: ${resolve(newQmdDir, "index.sqlite")}${c.reset}`);
+      console.log(`\n${c.dim}QMD will now use this directory from anywhere.${c.reset}`);
+      console.log(`${c.dim}Run 'qmd init clear' to reset to auto-discovery mode.${c.reset}`);
+      break;
+    }
+
+    case "where": {
+      // Show where the index is stored and why
+      const cliQmdDir = getCliQmdDir();
+      const savedQmdDir = loadQmdDirConfig();
+      const autoQmdDir = findLocalQmdDir();
+      const effectiveDir = getEffectiveQmdDir();
+      const dbPath = getDefaultDbPath(cli.indexName);
+      
+      console.log(`${c.bold}QMD Index Location${c.reset}\n`);
+      console.log(`${c.dim}Database:${c.reset}  ${dbPath}`);
+      
+      if (effectiveDir) {
+        console.log(`${c.dim}Directory:${c.reset} ${effectiveDir}`);
+      }
+      
+      console.log(`\n${c.bold}Resolution Priority:${c.reset}`);
+      console.log(`  1. CLI flag (--qmd-dir):   ${cliQmdDir ? `${c.green}${cliQmdDir}${c.reset} ${c.dim}(active)${c.reset}` : `${c.dim}not set${c.reset}`}`);
+      console.log(`  2. Saved config:           ${savedQmdDir ? `${savedQmdDir}${cliQmdDir ? '' : ` ${c.dim}(active)${c.reset}`}` : `${c.dim}not set${c.reset}`}`);
+      console.log(`  3. Auto-discover:          ${autoQmdDir ? `${autoQmdDir}${!cliQmdDir && !savedQmdDir ? ` ${c.dim}(active)${c.reset}` : ''}` : `${c.dim}none found${c.reset}`}`);
+      
+      if (!effectiveDir) {
+        console.log(`\n${c.yellow}Using global index${c.reset} (not portable)`);
+        console.log(`${c.dim}Run 'qmd init /path/to/data' to create a portable index${c.reset}`);
       }
       break;
     }
