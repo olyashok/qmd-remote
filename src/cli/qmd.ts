@@ -1742,6 +1742,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   const result = await generateEmbeddings(storeInstance, {
     force,
     model,
+    llm: shouldUseRemote() ? getDefaultRemoteLLM() : undefined,
     onProgress: (info) => {
       if (info.totalBytes === 0) return;
       const percent = (info.bytesProcessed / info.totalBytes) * 100;

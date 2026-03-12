@@ -1274,6 +1274,7 @@ export async function generateEmbeddings(
     force?: boolean;
     model?: string;
     onProgress?: (info: EmbedProgress) => void;
+    llm?: LLM;
   }
 ): Promise<EmbedResult> {
   const db = store.db;
@@ -1290,6 +1291,10 @@ export async function generateEmbeddings(
     return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
   }
 
+  // Use provided LLM (e.g. RemoteLLM), or fall back to store's LlamaCpp / global singleton
+  const llm = options?.llm ?? getLlm(store);
+  const isLocalLlm = llm instanceof LlamaCpp;
+
   // Chunk all documents
   type ChunkItem = { hash: string; title: string; text: string; seq: number; pos: number; tokens: number; bytes: number };
   const allChunks: ChunkItem[] = [];
@@ -1300,7 +1305,7 @@ export async function generateEmbeddings(
     if (bodyBytes === 0) continue;
 
     const title = extractTitle(item.body, item.path);
-    const chunks = await chunkDocumentByTokens(item.body);
+    const chunks = await chunkDocumentByTokens(item.body, undefined, undefined, undefined, { skipTokenize: !isLocalLlm });
 
     for (let seq = 0; seq < chunks.length; seq++) {
       allChunks.push({
@@ -1324,16 +1329,12 @@ export async function generateEmbeddings(
   const totalDocs = hashesToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
-  const llm = getLlm(store);
-  const sessionOptions: LLMSessionOptions = { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' };
-
-  // Create a session manager for this llm instance
-  const result = await withLLMSessionForLlm(llm, async (session) => {
+  // Inner embedding loop — works with any object that has embed() and embedBatch()
+  async function runEmbedLoop(backend: { embed: (text: string) => Promise<any>; embedBatch: (texts: string[]) => Promise<any[]> }) {
     // Get embedding dimensions from first chunk
     const firstChunk = allChunks[0]!;
     const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-    const firstResult = await session.embed(firstText);
+    const firstResult = await backend.embed(firstText);
     if (!firstResult) {
       throw new Error("Failed to get embedding dimensions from first chunk");
     }
@@ -1348,7 +1349,7 @@ export async function generateEmbeddings(
       const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
 
       try {
-        const embeddings = await session.embedBatch(texts);
+        const embeddings = await backend.embedBatch(texts);
         for (let i = 0; i < batch.length; i++) {
           const chunk = batch[i]!;
           const embedding = embeddings[i];
@@ -1365,7 +1366,7 @@ export async function generateEmbeddings(
         for (const chunk of batch) {
           try {
             const text = formatDocForEmbedding(chunk.text, chunk.title);
-            const result = await session.embed(text);
+            const result = await backend.embed(text);
             if (result) {
               insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
               chunksEmbedded++;
@@ -1383,7 +1384,13 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors };
-  }, sessionOptions);
+  }
+
+  // For non-LlamaCpp backends (e.g. RemoteLLM), call embed methods directly.
+  // For LlamaCpp, use the session manager which handles model loading/unloading.
+  const result = isLocalLlm
+    ? await withLLMSessionForLlm(llm, (session) => runEmbedLoop(session), { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' })
+    : await runEmbedLoop(llm);
 
   return {
     docsProcessed: totalDocs,
@@ -2031,10 +2038,9 @@ export async function chunkDocumentByTokens(
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
-  windowTokens: number = CHUNK_WINDOW_TOKENS
+  windowTokens: number = CHUNK_WINDOW_TOKENS,
+  options?: { skipTokenize?: boolean }
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
-
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
   const avgCharsPerToken = 3;
@@ -2044,6 +2050,17 @@ export async function chunkDocumentByTokens(
 
   // Chunk in character space with conservative estimate
   let charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
+
+  // When skipTokenize is set (e.g. remote LLM mode), use char-based estimates only
+  if (options?.skipTokenize) {
+    return charChunks.map(chunk => ({
+      text: chunk.text,
+      pos: chunk.pos,
+      tokens: Math.ceil(chunk.text.length / avgCharsPerToken),
+    }));
+  }
+
+  const llm = getDefaultLlamaCpp();
 
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
