@@ -35,6 +35,12 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import {
+  dedupeQdrantSearches,
+  isQdrantConfigured,
+  searchQdrant,
+  type QdrantSearch,
+} from "./qdrant.js";
 
 // =============================================================================
 // Configuration
@@ -62,7 +68,7 @@ export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
  * Get the LlamaCpp instance for a store — prefers the store's own instance,
  * falls back to the global singleton.
  */
-function getLlm(store: Store): LlamaCpp {
+function getLlm(store: Store): LLM {
   return store.llm ?? getDefaultLlamaCpp();
 }
 
@@ -1054,8 +1060,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
-  llm?: LlamaCpp;
+  /** Optional LLM backend for this store (overrides the local global singleton) */
+  llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -1681,6 +1687,10 @@ export type IndexStatus = {
 // =============================================================================
 
 export function getHashesNeedingEmbedding(db: Database): number {
+  // Qdrant-backed deployments embed changed chunks directly during
+  // qdrant-import. An empty local sqlite-vec table is intentional there, not
+  // an indication that every document needs `qmd embed`.
+  if (isQdrantConfigured()) return 0;
   const result = db.prepare(`
     SELECT COUNT(DISTINCT d.hash) as count
     FROM documents d
@@ -2877,6 +2887,7 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Returns hash, document body, and a sample path for display purposes.
  */
 export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
+  if (isQdrantConfigured()) return [];
   return db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path
     FROM documents d
@@ -3462,7 +3473,8 @@ export function getStatus(db: Database): IndexStatus {
 
   const totalDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 1`).get() as { c: number }).c;
   const needsEmbedding = getHashesNeedingEmbedding(db);
-  const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  const hasVectors = isQdrantConfigured()
+    || !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
   return {
     totalDocuments: totalDocs,
@@ -3540,7 +3552,10 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
   }
 
   const lines = searchBody.split('\n');
-  const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+  const queryTerms = query.toLowerCase().split(/\s+/)
+    .filter(term => !term.startsWith("-"))
+    .map(term => term.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+    .filter(term => term.length > 0);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   let bestLine = 0, bestScore = -1;
 
@@ -3664,6 +3679,91 @@ export type RankedListMeta = {
   query: string;
 };
 
+async function qdrantQuery(
+  store: Store,
+  searches: QdrantSearch[],
+  collections: string[] | undefined,
+  options: {
+    limit: number;
+    candidateLimit: number;
+    minScore: number;
+    explain: boolean;
+    intent?: string;
+    skipRerank: boolean;
+    hooks?: SearchHooks;
+    llm?: LLM;
+  },
+): Promise<HybridQueryResult[]> {
+  if (!collections || collections.length === 0) {
+    throw new Error("Qdrant-backed QMD search requires an explicit collection");
+  }
+  const llm = options.llm ?? getLlm(store);
+  const candidates = await searchQdrant(store.db, searches, {
+    collections,
+    limit: options.candidateLimit,
+    candidateLimit: options.candidateLimit,
+    llm,
+    hooks: options.hooks,
+  });
+  if (candidates.length === 0) return [];
+
+  const primaryQuery = searches.find(search => search.type === "lex")?.query
+    ?? searches.find(search => search.type === "vec")?.query
+    ?? searches[0]?.query
+    ?? "";
+  const retrievalRanks = new Map(candidates.map((candidate, index) => [candidate.file, index + 1]));
+  let rerankScores = new Map<string, number>();
+  if (!options.skipRerank) {
+    options.hooks?.onRerankStart?.(candidates.length);
+    const rerankStart = Date.now();
+    const reranked = await store.rerank(
+      primaryQuery,
+      candidates.map(candidate => ({ file: candidate.file, text: candidate.bestChunk })),
+      undefined,
+      options.intent,
+      llm,
+    );
+    options.hooks?.onRerankDone?.(Date.now() - rerankStart);
+    rerankScores = new Map(reranked.map(result => [result.file, result.score]));
+  }
+
+  return candidates
+    .map(candidate => {
+      const rerankScore = rerankScores.get(candidate.file);
+      const wasReranked = rerankScore !== undefined;
+      const retrievalWeight = wasReranked ? 0.4 : 1.0;
+      const score = wasReranked
+        ? (retrievalWeight * candidate.score) + ((1 - retrievalWeight) * rerankScore)
+        : candidate.score;
+      const explainData: HybridQueryExplain | undefined = options.explain ? {
+        // Qdrant performs body/title/dense RRF internally and its grouped
+        // response does not expose the individual ranked-list scores.
+        ftsScores: [],
+        vectorScores: [],
+        rrf: {
+          rank: retrievalRanks.get(candidate.file) ?? candidates.length,
+          positionScore: candidate.score,
+          weight: retrievalWeight,
+          baseScore: candidate.score,
+          topRankBonus: 0,
+          totalScore: candidate.score,
+          contributions: [],
+        },
+        rerankScore: rerankScore ?? 0,
+        blendedScore: score,
+      } : undefined;
+      return {
+        ...candidate,
+        context: getContextForFile(store.db, candidate.file),
+        score,
+        ...(explainData ? { explain: explainData } : {}),
+      };
+    })
+    .sort((a, b) => b.score - a.score)
+    .filter(candidate => candidate.score >= options.minScore)
+    .slice(0, options.limit);
+}
+
 /**
  * Hybrid search: BM25 + vector + query expansion + RRF + chunked reranking.
  *
@@ -3690,6 +3790,25 @@ export async function hybridQuery(
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
   const hooks = options?.hooks;
+
+  if (isQdrantConfigured()) {
+    const llm = options?.llm ?? getLlm(store);
+    hooks?.onExpandStart?.();
+    const expandStart = Date.now();
+    const expanded = await store.expandQuery(query, undefined, intent, llm);
+    hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
+    const searches = dedupeQdrantSearches([
+      { type: "lex", query },
+      { type: "vec", query },
+      ...expanded,
+    ]);
+    return qdrantQuery(
+      store,
+      searches,
+      collection ? [collection] : undefined,
+      { limit, candidateLimit, minScore, explain, intent, skipRerank, hooks, llm },
+    );
+  }
 
   const rankedLists: RankedResult[][] = [];
   const rankedListMeta: RankedListMeta[] = [];
@@ -3793,8 +3912,8 @@ export async function hybridQuery(
         })));
         rankedListMeta.push({
           source: "vec",
-          queryType: vecQueries[i]!.queryType,
-          query: vecQueries[i]!.text,
+          queryType: vecQueries[0]!.queryType,
+          query: vecQueries.map(item => item.text).join(" | "),
         });
       }
     }
@@ -4000,6 +4119,44 @@ export async function vectorSearchQuery(
   const collection = options?.collection;
   const intent = options?.intent;
 
+  if (isQdrantConfigured()) {
+    const llm = options?.llm ?? getLlm(store);
+    const expandStart = Date.now();
+    const allExpanded = await store.expandQuery(query, undefined, intent, llm);
+    const vecExpanded = allExpanded.filter(
+      (search): search is ExpandedQuery & { type: "vec" | "hyde" } =>
+        search.type === "vec" || search.type === "hyde",
+    );
+    options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
+    const searches = dedupeQdrantSearches([
+      { type: "vec", query },
+      ...vecExpanded,
+    ]);
+    const results = await qdrantQuery(
+      store,
+      searches,
+      collection ? [collection] : undefined,
+      {
+        limit,
+        candidateLimit: Math.max(limit, 40),
+        minScore,
+        explain: false,
+        intent,
+        skipRerank: true,
+        llm,
+      },
+    );
+    return results.map(result => ({
+      file: result.file,
+      displayPath: result.displayPath,
+      title: result.title,
+      body: result.body,
+      score: result.score,
+      context: result.context,
+      docid: result.docid,
+    }));
+  }
+
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
   ).get();
@@ -4122,6 +4279,19 @@ export async function structuredSearch(
         throw new Error(`${location} (${search.type}): ${error}`);
       }
     }
+  }
+
+  if (isQdrantConfigured()) {
+    return qdrantQuery(store, searches, collections, {
+      limit,
+      candidateLimit,
+      minScore,
+      explain,
+      intent,
+      skipRerank,
+      hooks,
+      llm: options?.llm,
+    });
   }
 
   const rankedLists: RankedResult[][] = [];

@@ -22,6 +22,8 @@ import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync,
 // Embedding Formatting Functions
 // =============================================================================
 
+const MAX_EMBED_CHARS = 1500;
+
 /**
  * Detect if a model URI uses the Qwen3-Embedding format.
  * Qwen3-Embedding uses a different prompting style than nomic/embeddinggemma.
@@ -73,9 +75,16 @@ export function formatDocForEmbedding(text: string, title?: string, modelUri?: s
   const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
-    return title ? `${truncatedTitle}\n${cleaned}` : cleaned;
+    const prefix = title ? `${truncatedTitle}\n` : "";
+    const availableChars = Math.max(0, MAX_EMBED_CHARS - prefix.length);
+    const truncatedText = cleaned.length > availableChars ? cleaned.slice(0, availableChars) : cleaned;
+    return `${prefix}${truncatedText}`;
   }
-  return `title: ${truncatedTitle} | text: ${cleaned}`;
+
+  const prefix = `title: ${truncatedTitle} | text: `;
+  const availableChars = Math.max(0, MAX_EMBED_CHARS - prefix.length);
+  const truncatedText = cleaned.length > availableChars ? cleaned.slice(0, availableChars) : cleaned;
+  return `${prefix}${truncatedText}`;
 }
 
 // =============================================================================

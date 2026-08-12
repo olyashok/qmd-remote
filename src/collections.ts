@@ -9,7 +9,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { join } from "path";
+import { dirname, join } from "path";
 import { homedir } from "os";
 import YAML from "yaml";
 
@@ -18,6 +18,22 @@ import YAML from "yaml";
 // ============================================================================
 
 let _qmdDirResolver: (() => string | null) | null = null;
+
+let configSource:
+  | { type: "file"; path?: string }
+  | { type: "inline"; config: CollectionConfig } = { type: "file" };
+
+/** Select a custom YAML path or in-memory config for SDK consumers. */
+export function setConfigSource(source?: { configPath?: string; config?: CollectionConfig }): void {
+  if (!source) {
+    configSource = { type: "file" };
+  } else if (source.config) {
+    source.config.collections ??= {};
+    configSource = { type: "inline", config: source.config };
+  } else {
+    configSource = { type: "file", ...(source.configPath ? { path: source.configPath } : {}) };
+  }
+}
 
 /**
  * Set the resolver for the effective .qmd directory.
@@ -103,7 +119,9 @@ function ensureConfigDir(): void {
  * Returns empty config if file doesn't exist.
  */
 export function loadConfig(): CollectionConfig {
-  const configPath = getConfigFilePath();
+  if (configSource.type === "inline") return configSource.config;
+
+  const configPath = configSource.path ?? getConfigFilePath();
   if (!existsSync(configPath)) {
     return { collections: {} };
   }
@@ -127,8 +145,14 @@ export function loadConfig(): CollectionConfig {
  * Save configuration to {qmdDir}/index.yml (when using .qmd dir) or ~/.config/qmd/index.yml.
  */
 export function saveConfig(config: CollectionConfig): void {
-  ensureConfigDir();
-  const configPath = getConfigFilePath();
+  if (configSource.type === "inline") {
+    configSource.config = config;
+    return;
+  }
+
+  const configPath = configSource.path ?? getConfigFilePath();
+  const configDir = dirname(configPath);
+  if (!existsSync(configDir)) mkdirSync(configDir, { recursive: true });
 
   try {
     const yaml = YAML.stringify(config, {

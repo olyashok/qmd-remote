@@ -86,13 +86,6 @@ import {
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import { RemoteLLM, loadRemoteConfig, saveRemoteConfig, clearRemoteConfig, isRemoteConfigured, getDefaultRemoteLLM, disposeDefaultRemoteLLM, withRemoteLLMSession, loadQmdDirConfig, saveQmdDirConfig, clearQmdDirConfig } from "../llm-remote.js";
 import { loadMirrorConfig, saveMirrorConfig, clearMirrorConfig, syncMirror, isMirrorStale, mirrorAgeString, type MirrorConfig } from "../mirror.js";
-
-/**
- * Set whether to force local mode (ignoring remote config)
- */
-function setForceLocalMode(force: boolean): void {
-  forceLocalMode = force;
-}
 import {
   formatSearchResults,
   formatDocuments,
@@ -113,6 +106,8 @@ import {
   setConfigDirResolver,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
+import { importQdrant } from "../qdrant-import.js";
+import { isQdrantConfigured } from "../qdrant.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -413,7 +408,9 @@ async function showStatus(): Promise<void> {
 
   console.log(`${c.bold}Documents${c.reset}`);
   console.log(`  Total:    ${totalDocs.count} files indexed`);
-  console.log(`  Vectors:  ${vectorCount.count} embedded`);
+  console.log(isQdrantConfigured()
+    ? `  Vectors:  Qdrant backend (no local vector copy)`
+    : `  Vectors:  ${vectorCount.count} embedded`);
   if (needsEmbedding > 0) {
     console.log(`  ${c.yellow}Pending:  ${needsEmbedding} need embedding${c.reset} (run 'qmd embed')`);
   }
@@ -2175,13 +2172,49 @@ function parseStructuredQuery(query: string): ParsedStructuredQuery | null {
   return typed.length > 0 ? { searches: typed, intent } : null;
 }
 
-function search(query: string, opts: OutputOptions): void {
-  const db = getDb();
-
+async function search(query: string, opts: OutputOptions): Promise<void> {
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
   const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+
+  if (isQdrantConfigured()) {
+    const store = getStore();
+    try {
+      checkIndexHealth(store.db);
+      const results = await structuredSearch(
+        store,
+        [{ type: "lex", query }],
+        {
+          collections: collectionNames,
+          limit: Math.min(100, opts.all ? 100 : (opts.limit || 10)),
+          minScore: opts.minScore || 0,
+          candidateLimit: opts.candidateLimit,
+          skipRerank: true,
+        },
+      );
+
+      if (results.length === 0) {
+        printEmptySearchResults(opts.format);
+        return;
+      }
+      outputResults(results.map(result => ({
+        file: result.file,
+        displayPath: result.displayPath,
+        title: result.title,
+        body: result.body,
+        chunkPos: result.bestChunkPos,
+        score: result.score,
+        context: result.context,
+        docid: result.docid,
+      })), query, { ...opts, limit: results.length });
+    } finally {
+      closeDb();
+    }
+    return;
+  }
+
+  const db = getDb();
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
@@ -2320,6 +2353,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         candidateLimit: opts.candidateLimit,
         explain: !!opts.explain,
         intent,
+        llm: shouldUseRemote() ? getDefaultRemoteLLM() : undefined,
         hooks: {
           onEmbedStart: (count) => {
             process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
@@ -2398,12 +2432,14 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
       : query;
 
-    // Map to CLI output format — use bestChunk for snippet display
+    // Snippet extraction expects a full body plus a document-relative chunk
+    // position. Passing the chunk body with the global position can seek past
+    // the end of the string and produce an unrelated leading snippet.
     outputResults(results.map(r => ({
       file: r.file,
       displayPath: r.displayPath,
       title: r.title,
-      body: r.bestChunk,
+      body: r.body,
       chunkPos: r.bestChunkPos,
       score: r.score,
       context: r.context,
@@ -2670,6 +2706,7 @@ function showHelp(): void {
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
   console.log("  qmd embed [-f]                - Generate/refresh vector embeddings");
+  console.log("  qmd qdrant-import             - Resume mirroring the SQLite index into Qdrant");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
   console.log("Query syntax (qmd query):");
@@ -3060,6 +3097,11 @@ if (isMain) {
       await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
       break;
 
+    case "qdrant-import":
+      closeDb();
+      await importQdrant();
+      break;
+
     case "pull": {
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
       const models = [
@@ -3085,7 +3127,7 @@ if (isMain) {
         console.error("Usage: qmd search [options] <query>");
         process.exit(1);
       }
-      search(cli.query, cli.opts);
+      await search(cli.query, cli.opts);
       break;
 
     case "vsearch":

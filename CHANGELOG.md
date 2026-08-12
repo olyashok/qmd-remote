@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Add an optional Qdrant-backed lexical, vector, and hybrid retrieval path with
+  explicit collection security domains and a resumable direct-indexing CLI.
+- Support authenticated remote generation without persisting the runtime API
+  key in the exported LLM configuration.
+
+### Fixes
+
+- Sanitize invalid UTF-16 before remote embedding requests and improve phrase
+  and negative-term handling in snippets and Qdrant lexical queries.
+- Pin patched transitive dependency releases used by the service image.
+
 ## [2.0.1] - 2026-03-10
 
 ### Changes

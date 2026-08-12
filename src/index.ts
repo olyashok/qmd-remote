@@ -65,6 +65,7 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  type LLM,
 } from "./llm.js";
 import {
   setConfigSource,
@@ -159,6 +160,8 @@ export interface SearchOptions {
   limit?: number;
   /** Minimum score threshold */
   minScore?: number;
+  /** Maximum candidates to retrieve before reranking */
+  candidateLimit?: number;
   /** Include explain traces */
   explain?: boolean;
 }
@@ -200,6 +203,8 @@ export interface StoreOptions {
   configPath?: string;
   /** Inline collection config (mutually exclusive with `configPath`) */
   config?: CollectionConfig;
+  /** Optional local or remote LLM backend used by search and indexing */
+  llm?: LLM;
 }
 
 /**
@@ -356,9 +361,10 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
+  // Use an explicitly supplied backend (for example RemoteLLM), otherwise
+  // create the normal per-store local backend. Keeping the backend on the
+  // internal store makes every SDK/MCP search path use the same implementation.
+  const llm = options.llm ?? new LlamaCpp({
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
@@ -386,6 +392,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           collections: collections.length > 0 ? collections : undefined,
           limit: opts.limit,
           minScore: opts.minScore,
+          candidateLimit: opts.candidateLimit,
           explain: opts.explain,
           intent: opts.intent,
           skipRerank,
@@ -397,6 +404,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         collection: collections[0],
         limit: opts.limit,
         minScore: opts.minScore,
+        candidateLimit: opts.candidateLimit,
         explain: opts.explain,
         intent: opts.intent,
         skipRerank,

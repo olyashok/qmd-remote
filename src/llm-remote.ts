@@ -25,6 +25,31 @@ import type {
   LLMSessionOptions,
 } from "./llm.js";
 
+function sanitizeEmbeddingInput(text: string): string {
+  let wellFormed = "";
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = text.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        wellFormed += text[index]! + text[index + 1]!;
+        index += 1;
+      } else {
+        wellFormed += "\uFFFD";
+      }
+    } else if (code >= 0xDC00 && code <= 0xDFFF) {
+      wellFormed += "\uFFFD";
+    } else {
+      wellFormed += text[index]!;
+    }
+  }
+  return wellFormed
+    .replace(/\u0000/g, " ")
+    .replace(/[\u0001-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -39,6 +64,16 @@ export type RemoteLLMConfig = {
 // Config file path
 const CONFIG_DIR = join(homedir(), ".cache", "qmd");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
+
+export function loadGenerateApiKey(): string | null {
+  const inline = process.env.QMD_GENERATE_API_KEY?.trim();
+  if (inline) return inline;
+
+  const keyFile = process.env.QMD_GENERATE_API_KEY_FILE?.trim();
+  if (!keyFile) return null;
+  const value = readFileSync(keyFile, "utf-8").trim();
+  return value || null;
+}
 
 /**
  * Load remote config from file
@@ -184,6 +219,7 @@ export class RemoteLLM implements LLM {
   private rerankUrl: string | null;
   private generateUrl: string | null;
   private generateModel: string | null;
+  private generateApiKey: string | null;
 
   constructor(config: RemoteLLMConfig = {}) {
     // Load from saved config, then override with explicit config
@@ -192,41 +228,43 @@ export class RemoteLLM implements LLM {
     this.rerankUrl = config.rerankUrl ?? savedConfig.rerankUrl ?? null;
     this.generateUrl = config.generateUrl ?? savedConfig.generateUrl ?? null;
     this.generateModel = config.generateModel ?? savedConfig.generateModel ?? null;
+    this.generateApiKey = loadGenerateApiKey();
   }
 
-  /**
-   * Get embeddings via remote server (retries up to 3 times on transient errors)
-   */
+  /** Get embeddings via remote server. */
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     if (!this.embedUrl) {
       console.error("No embed URL configured");
       return null;
     }
 
-    const MAX_RETRIES = 3;
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      try {
+    try {
+      let embedText = sanitizeEmbeddingInput(text);
+
+      for (let attempt = 0; attempt < 2; attempt++) {
         const response = await fetch(`${this.embedUrl}/v1/embeddings`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            input: text,
+            input: embedText,
             model: "embeddinggemma",
           }),
         });
 
-        if (response.status === 400) {
-          // Client error — retrying won't help
-          console.error(`Embed request failed: ${response.status} ${response.statusText}`);
-          return null;
-        }
-
         if (!response.ok) {
-          console.error(`Embed request failed: ${response.status} ${response.statusText}`);
-          if (attempt < MAX_RETRIES - 1) {
-            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-            continue;
+          const body = await response.text().catch(() => "");
+          const preview = body ? ` - ${body.slice(0, 300)}` : "";
+
+          if (response.status === 400 && attempt === 0) {
+            const sanitized = sanitizeEmbeddingInput(embedText);
+            if (sanitized && sanitized !== embedText) {
+              console.error(`Embed request failed: ${response.status} ${response.statusText}${preview}; retrying with sanitized input`);
+              embedText = sanitized;
+              continue;
+            }
           }
+
+          console.error(`Embed request failed: ${response.status} ${response.statusText}${preview}`);
           return null;
         }
 
@@ -240,19 +278,17 @@ export class RemoteLLM implements LLM {
           return null;
         }
 
+        const first = data.data[0]!;
         return {
-          embedding: data.data[0]!.embedding,
+          embedding: first.embedding,
           model: data.model || "remote-embed",
         };
-      } catch (error) {
-        if (attempt < MAX_RETRIES - 1) {
-          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-          continue;
-        }
-        console.error("Embedding error:", error);
-        return null;
       }
+    } catch (error) {
+      console.error("Embedding error:", error);
+      return null;
     }
+
     return null;
   }
 
@@ -272,14 +308,14 @@ export class RemoteLLM implements LLM {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          input: texts,
+          input: texts.map(sanitizeEmbeddingInput),
           model: "embeddinggemma",
         }),
       });
 
       if (!response.ok) {
         console.error(`Batch embed failed: ${response.status} ${response.statusText}`);
-        // Fall back to sequential individual requests (each has retries)
+        // Fall back to sequential individual requests (avoids DB locking)
         const results: (EmbeddingResult | null)[] = [];
         for (const text of texts) {
           results.push(await this.embed(text));
@@ -310,7 +346,7 @@ export class RemoteLLM implements LLM {
       return results;
     } catch (error) {
       console.error("Batch embedding error:", error);
-      // Fall back to sequential individual requests (each has retries)
+      // Fall back to sequential individual requests (avoids DB locking)
       const results: (EmbeddingResult | null)[] = [];
       for (const text of texts) {
         results.push(await this.embed(text));
@@ -339,7 +375,10 @@ export class RemoteLLM implements LLM {
       }
       const response = await fetch(`${this.generateUrl}/v1/completions`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(this.generateApiKey ? { Authorization: `Bearer ${this.generateApiKey}` } : {}),
+        },
         body: JSON.stringify(body),
       });
 
@@ -607,10 +646,13 @@ Final Output:`;
   async checkHealth(): Promise<{ embed: boolean; rerank: boolean; generate: boolean }> {
     const results = { embed: false, rerank: false, generate: false };
 
-    const checkEndpoint = async (url: string | null): Promise<boolean> => {
+    const checkEndpoint = async (url: string | null, apiKey?: string | null): Promise<boolean> => {
       if (!url) return false;
       try {
-        const response = await fetch(`${url}/health`, { method: "GET" });
+        const response = await fetch(`${url}/health`, {
+          method: "GET",
+          headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
+        });
         return response.ok;
       } catch {
         return false;
@@ -620,7 +662,7 @@ Final Output:`;
     [results.embed, results.rerank, results.generate] = await Promise.all([
       checkEndpoint(this.embedUrl),
       checkEndpoint(this.rerankUrl),
-      checkEndpoint(this.generateUrl),
+      checkEndpoint(this.generateUrl, this.generateApiKey),
     ]);
 
     return results;

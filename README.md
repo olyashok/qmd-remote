@@ -135,6 +135,87 @@ LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
 
+### Qdrant backend
+
+QMD can keep SQLite as its document/content source while using Qdrant for
+chunk-level dense, BM25 body, and BM25 title retrieval. Enable it with:
+
+```sh
+export QMD_QDRANT_URL=https://qdrant.example.internal:6333
+export QMD_QDRANT_API_KEY='...'
+export QMD_QDRANT_ALLOWED_DOMAINS=public,shape
+export NODE_EXTRA_CA_CERTS=/etc/qmd/qdrant-ca.crt
+# Optional remote query-expansion credential. Prefer the file form in services.
+export QMD_GENERATE_API_KEY_FILE=/run/secrets/generate-api-key
+qmd qdrant-import --batch-size 256 --concurrency 8 --document-concurrency 16
+```
+
+The import is resumable. Its cursor and document/hash manifest default to
+`~/.qmd/qdrant-import.json` and `~/.qmd/qdrant-manifest.sqlite`. After the
+initial pass, every invocation reconciles changed, moved, and inactive SQLite
+documents rather than rebuilding unchanged points.
+
+With Qdrant configured, `qmd update && qmd qdrant-import` is the complete
+incremental workflow. The importer chunks changed document bodies, obtains
+dense embeddings directly from the configured embedding service, and upserts
+dense plus BM25 points to Qdrant. It does not populate or read SQLite's
+`content_vectors`/`vectors_vec` tables, and an accidental `qmd embed` is a
+no-op. The manifest records the embedding model/dimension and chunk-layout
+versions so incompatible changes are re-indexed deliberately.
+
+Use `--document-id ID` to force-refresh one active document. Use `--rebuild`
+to rebuild every document into the configured Qdrant collection generation:
+
+```sh
+qmd qdrant-import --document-id 12345
+qmd qdrant-import --rebuild --batch-size 256 --concurrency 8
+```
+
+`--rebuild` replaces each document safely, but it targets the configured
+collections. For production migrations, point it at new versioned collections,
+validate them, and switch stable aliases only after the rebuild passes.
+
+When Qdrant is configured, the CLI `search`, `vsearch`, and `query` commands
+and the MCP/HTTP structured-query path retrieve candidates from Qdrant. They
+still hydrate full document bodies from SQLite, so the SQLite index remains a
+required local content store rather than a disposable import artifact.
+
+The Qdrant path preserves QMD's query pipeline. `query` expands the original
+request into lexical, dense, and HyDE subqueries, embeds the dense/HyDE
+subqueries, fuses Qdrant candidates, and reranks the result set. `vsearch`
+uses the vector/HyDE portions of the same expansion. A pre-expanded structured
+query remains under caller control and is not expanded a second time. Remote
+generation accepts either `QMD_GENERATE_API_KEY_FILE` (preferred for mounted
+runtime secrets) or `QMD_GENERATE_API_KEY`; neither value is persisted in QMD
+configuration or returned by status commands.
+
+Qdrant search requires explicit QMD collections. Collection names beginning
+with `project-`, `email-`, or `gdrive_`, plus `wip` and `shape_docusign`, map to
+the `shape` security domain. Known municipal/county prefixes map to `public`;
+an unknown collection fails closed until it is classified in code. A runtime must
+explicitly allow each domain through `QMD_QDRANT_ALLOWED_DOMAINS`. The default
+stable aliases are `cellect_public_current` and `tenant_shape_current`; override
+them with `QMD_QDRANT_PUBLIC_COLLECTION` and
+`QMD_QDRANT_SHAPE_COLLECTION` when needed.
+
+The Qdrant credential is a backend secret. Do not expose it to MCP clients or
+agents. Put authentication and per-runtime collection authorization in front
+of a shared HTTP service when callers within one host have different tenant
+permissions.
+
+Qdrant returns chunk points, but QMD groups them by `document_id` before
+hydrating complete documents from SQLite. Body BM25 and dense vectors are fused
+at chunk level; the separate title point is ranked independently and the two
+document lists are fused in QMD. This avoids letting a long document occupy the
+entire candidate set or letting a repeated title inflate every chunk.
+With `--explain`, QMD reports the backend fused score, reranker score, and final
+blend. Per-source lexical/vector score arrays are empty because the grouped
+Qdrant response does not expose those internal component scores.
+
+`Dockerfile.qdrant` builds the runtime directly from this repository on a
+digest-pinned Bun 1.3.13 image. Dependencies are installed from `bun.lock`; the
+runtime image does not depend on a pre-existing local QMD image.
+
 ### SDK / Library Usage
 
 Use QMD as a library in your own Node.js or Bun applications.

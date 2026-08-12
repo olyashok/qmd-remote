@@ -1773,6 +1773,13 @@ describe("Snippet Extraction", () => {
     expect(snippet).toContain("keyword");
   });
 
+  test("extractSnippet strips phrase punctuation and ignores negative terms", () => {
+    const body = "unrelated opening\nLooseleaf Supplement revision instructions\nbaseball should not win";
+    const { line, snippet } = extractSnippet(body, '\"Looseleaf Supplement\" -baseball', 500);
+    expect(line).toBe(2);
+    expect(snippet).toContain("Looseleaf Supplement revision instructions");
+  });
+
   test("extractSnippet includes context lines", () => {
     const body = "Line 1\nLine 2\nLine 3 has keyword\nLine 4\nLine 5";
     const { snippet } = extractSnippet(body, "keyword", 500);

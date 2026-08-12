@@ -26,6 +26,15 @@ import {
   type ExpandedQuery,
   type IndexStatus,
 } from "../index.js";
+import { getDefaultRemoteLLM, isRemoteConfigured } from "../llm-remote.js";
+import { isQdrantConfigured } from "../qdrant.js";
+
+async function createServerStore(): Promise<QMDStore> {
+  return createStore({
+    dbPath: getDefaultDbPath(),
+    ...(isRemoteConfigured() ? { llm: getDefaultRemoteLLM() } : {}),
+  });
+}
 
 // =============================================================================
 // Types for structured content
@@ -215,7 +224,7 @@ async function createMcpServer(store: QMDStore): Promise<McpServer> {
       "lex = BM25 keywords (supports \"phrase\" and -negation); " +
       "vec = semantic question; hyde = hypothetical answer passage"
     ),
-    query: z.string().describe(
+    query: z.string().min(1).max(4096).describe(
       "The query text. For lex: use keywords, \"quoted phrases\", and -negation. " +
       "For vec: natural language question. For hyde: 50-100 word answer passage."
     ),
@@ -287,18 +296,21 @@ Intent-aware lex (C++ performance, not sports):
         searches: z.array(subSearchSchema).min(1).max(10).describe(
           "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight."
         ),
-        limit: z.number().optional().default(10).describe("Max results (default: 10)"),
-        minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
-        candidateLimit: z.number().optional().describe(
+        limit: z.number().int().min(1).max(100).optional().default(10).describe("Max results (default: 10)"),
+        minScore: z.number().min(0).max(1).optional().default(0).describe("Min relevance 0-1 (default: 0)"),
+        candidateLimit: z.number().int().min(1).max(100).optional().describe(
           "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
         ),
-        collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
-        intent: z.string().optional().describe(
+        collections: z.array(z.string().min(1).max(200)).max(50).optional().describe("Filter to collections (OR match)"),
+        intent: z.string().max(1000).optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
       },
     },
     async ({ searches, limit, minScore, candidateLimit, collections, intent }) => {
+      if (isQdrantConfigured() && (!collections || collections.length === 0)) {
+        throw new Error("Qdrant-backed search requires explicit collections");
+      }
       // Map to internal format
       const queries: ExpandedQuery[] = searches.map(s => ({
         type: s.type,
@@ -313,6 +325,7 @@ Intent-aware lex (C++ performance, not sports):
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
+        candidateLimit,
         intent,
       });
 
@@ -520,7 +533,7 @@ Intent-aware lex (C++ performance, not sports):
 // =============================================================================
 
 export async function startMcpServer(): Promise<void> {
-  const store = await createStore({ dbPath: getDefaultDbPath() });
+  const store = await createServerStore();
   const server = await createMcpServer(store);
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -540,8 +553,9 @@ export type HttpServerHandle = {
  * Start MCP server over Streamable HTTP (JSON responses, no SSE).
  * Binds to localhost only. Returns a handle for shutdown and port discovery.
  */
-export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
-  const store = await createStore({ dbPath: getDefaultDbPath() });
+export async function startMcpHttpServer(port: number, options?: { quiet?: boolean; host?: string }): Promise<HttpServerHandle> {
+  const store = await createServerStore();
+  const host = options?.host ?? process.env.QMD_HOST ?? "localhost";
 
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
@@ -601,10 +615,30 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     if (!quiet) console.error(msg);
   }
 
+  class RequestBodyTooLargeError extends Error {}
+  const configuredMaxBody = Number(process.env.QMD_HTTP_MAX_BODY_BYTES || 1_048_576);
+  const maxBodyBytes = Number.isSafeInteger(configuredMaxBody) && configuredMaxBody > 0
+    ? Math.min(configuredMaxBody, 10_485_760)
+    : 1_048_576;
+
   // Helper to collect request body
   async function collectBody(req: IncomingMessage): Promise<string> {
     const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
+    let received = 0;
+    let tooLarge = false;
+    for await (const chunk of req) {
+      const buffer = chunk as Buffer;
+      received += buffer.byteLength;
+      if (received > maxBodyBytes) {
+        // Keep draining the request before responding. Throwing from the async
+        // iterator destroys the Node request stream and can cause an implicit
+        // empty 200 response before the handler emits its intended 413.
+        tooLarge = true;
+      } else {
+        chunks.push(buffer);
+      }
+    }
+    if (tooLarge) throw new RequestBodyTooLargeError();
     return Buffer.concat(chunks).toString();
   }
 
@@ -633,6 +667,48 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           nodeRes.end(JSON.stringify({ error: "Missing required field: searches (array)" }));
           return;
         }
+        const validSearches = params.searches.length >= 1
+          && params.searches.length <= 10
+          && params.searches.every((search: any) => (
+            ["lex", "vec", "hyde"].includes(search?.type)
+            && typeof search?.query === "string"
+            && search.query.length >= 1
+            && search.query.length <= 4096
+          ));
+        const validCollections = params.collections === undefined || (
+          Array.isArray(params.collections)
+          && params.collections.length <= 50
+          && params.collections.every((collection: unknown) => (
+            typeof collection === "string" && collection.length >= 1 && collection.length <= 200
+          ))
+        );
+        const validLimit = params.limit === undefined || (
+          Number.isSafeInteger(params.limit) && params.limit >= 1 && params.limit <= 100
+        );
+        const validCandidateLimit = params.candidateLimit === undefined || (
+          Number.isSafeInteger(params.candidateLimit)
+          && params.candidateLimit >= 1
+          && params.candidateLimit <= 100
+        );
+        const validMinScore = params.minScore === undefined || (
+          typeof params.minScore === "number" && params.minScore >= 0 && params.minScore <= 1
+        );
+        const validIntent = params.intent === undefined || (
+          typeof params.intent === "string" && params.intent.length <= 1000
+        );
+        if (
+          !validSearches || !validCollections || !validLimit
+          || !validCandidateLimit || !validMinScore || !validIntent
+        ) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Invalid search parameters" }));
+          return;
+        }
+        if (isQdrantConfigured() && (!Array.isArray(params.collections) || params.collections.length === 0)) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Qdrant-backed search requires explicit collections" }));
+          return;
+        }
 
         // Map to internal format
         const queries: ExpandedQuery[] = params.searches.map((s: any) => ({
@@ -648,7 +724,9 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
           limit: params.limit ?? 10,
           minScore: params.minScore ?? 0,
+          candidateLimit: params.candidateLimit,
           intent: params.intent,
+          rerank: params.rerank !== false,
         });
 
         // Use first lex or vec query for snippet extraction
@@ -761,6 +839,11 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
       nodeRes.writeHead(404);
       nodeRes.end("Not Found");
     } catch (err) {
+      if (err instanceof RequestBodyTooLargeError) {
+        nodeRes.writeHead(413, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ error: "Request body too large" }));
+        return;
+      }
       console.error("HTTP handler error:", err);
       nodeRes.writeHead(500);
       nodeRes.end("Internal Server Error");
@@ -769,7 +852,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "localhost", () => resolve());
+    httpServer.listen(port, host, () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
@@ -797,7 +880,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     process.exit(0);
   });
 
-  log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
+  log(`QMD MCP server listening on http://${host}:${actualPort}/mcp`);
   return { httpServer, port: actualPort, stop };
 }
 
