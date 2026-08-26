@@ -4,8 +4,10 @@ import {
   mergeQdrantRankedPoints,
   parseQdrantLexQuery,
   qdrantDomainForCollection,
+  qdrantSearchFilter,
 } from "../src/qdrant.js";
 import {
+  aclPayloadForDocument,
   buildQdrantPoints,
   expectedPointCount,
   initializeManifest,
@@ -115,12 +117,37 @@ describe("Qdrant collection security domains", () => {
     ["gdrive_alex-shape-tech", "shape"],
     ["shape_docusign", "shape"],
     ["wip", "shape"],
+    ["rooms-shape-24-bright", "shape"],
   ])("maps %s to %s", (collection, domain) => {
     expect(qdrantDomainForCollection(collection)).toBe(domain);
   });
 
   test("fails closed for a new unclassified collection", () => {
     expect(() => qdrantDomainForCollection("tenant-acme")).toThrow("not classified");
+  });
+});
+
+describe("Qdrant scoped ACL", () => {
+  test("adds every mandatory authorization dimension to the retrieval filter", () => {
+    expect(qdrantSearchFilter(["rooms-shape-24-bright"], {
+      tenant: "shape",
+      scopes: ["project:24-bright-street"],
+      access: ["documents", "construction"],
+    })).toEqual({ must: [
+      { key: "source_collection", match: { any: ["rooms-shape-24-bright"] } },
+      { key: "tenant_id", match: { value: "shape" } },
+      { key: "scope_keys", match: { any: ["project:24-bright-street"] } },
+      { key: "access_classes", match: { any: ["documents", "construction"] } },
+    ] });
+  });
+
+  test("fails closed when an ACL is incomplete", () => {
+    expect(() => qdrantSearchFilter(["rooms-shape-24-bright"], {
+      tenant: "shape", scopes: [], access: ["documents"],
+    })).toThrow("requires tenant, scopes, and access");
+    expect(() => aclPayloadForDocument({ path: "missing.md" }, {
+      QMD_ACL_MANIFEST_REQUIRED: "1",
+    })).toThrow("QMD_ACL_MANIFEST is required");
   });
 });
 

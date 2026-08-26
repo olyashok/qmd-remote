@@ -28,6 +28,12 @@ import {
 } from "../index.js";
 import { getDefaultRemoteLLM, isRemoteConfigured } from "../llm-remote.js";
 import { isQdrantConfigured } from "../qdrant.js";
+import {
+  bearerToken as scopedBearerToken,
+  loadScopedSearchConfig,
+  ScopedAuthError,
+  verifyScopedSearchToken,
+} from "../scoped-auth.js";
 
 async function createServerStore(): Promise<QMDStore> {
   return createStore({
@@ -556,6 +562,7 @@ export type HttpServerHandle = {
 export async function startMcpHttpServer(port: number, options?: { quiet?: boolean; host?: string }): Promise<HttpServerHandle> {
   const store = await createServerStore();
   const host = options?.host ?? process.env.QMD_HOST ?? "localhost";
+  const scopedSearchConfig = loadScopedSearchConfig();
 
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
@@ -652,6 +659,89 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(body);
         log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      if (pathname === "/scoped-query" && nodeReq.method === "POST") {
+        if (!scopedSearchConfig) {
+          nodeRes.writeHead(404, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Not found" }));
+          return;
+        }
+        const claims = verifyScopedSearchToken(
+          scopedBearerToken(nodeReq.headers.authorization),
+          scopedSearchConfig,
+        );
+        const params = JSON.parse(await collectBody(nodeReq));
+        const validSearches = params.searches === undefined || (Array.isArray(params.searches)
+          && params.searches.length >= 1
+          && params.searches.length <= 10
+          && params.searches.every((search: unknown) => {
+            if (!search || typeof search !== "object") return false;
+            const item = search as Record<string, unknown>;
+            return ["lex", "vec", "hyde"].includes(String(item.type))
+              && typeof item.query === "string" && item.query.length >= 1 && item.query.length <= 4096;
+          }));
+        const validQuery = params.query === undefined
+          || (typeof params.query === "string" && params.query.length >= 1 && params.query.length <= 4096);
+        const hasExactlyOneQueryForm = (params.query === undefined) !== (params.searches === undefined);
+        const validLimit = params.limit === undefined
+          || (Number.isSafeInteger(params.limit) && params.limit >= 1 && params.limit <= 100);
+        const validCandidateLimit = params.candidateLimit === undefined
+          || (Number.isSafeInteger(params.candidateLimit) && params.candidateLimit >= 1 && params.candidateLimit <= 100);
+        const validMinScore = params.minScore === undefined
+          || (typeof params.minScore === "number" && params.minScore >= 0 && params.minScore <= 1);
+        const validIntent = params.intent === undefined
+          || (typeof params.intent === "string" && params.intent.length <= 1000);
+        if (!validSearches || !validQuery || !hasExactlyOneQueryForm || !validLimit || !validCandidateLimit || !validMinScore || !validIntent) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Invalid scoped search parameters" }));
+          return;
+        }
+        if (params.collections !== undefined || params.collection !== undefined || params.qdrantScope !== undefined) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Scoped collections and ACL are server controlled" }));
+          return;
+        }
+        const queries: ExpandedQuery[] = params.query === undefined
+          ? params.searches.map((search: Record<string, unknown>) => ({
+            type: search.type as "lex" | "vec" | "hyde",
+            query: String(search.query),
+          }))
+          : (await store.expandQuery(String(params.query), { intent: params.intent })).slice(0, 10);
+        if (queries.length === 0) {
+          nodeRes.writeHead(503, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Query expansion returned no searches" }));
+          return;
+        }
+        const results = await store.search({
+          queries,
+          collections: scopedSearchConfig.collections,
+          qdrantScope: { tenant: claims.tenant, scopes: claims.scopes, access: claims.access },
+          limit: params.limit ?? 10,
+          minScore: params.minScore ?? 0,
+          candidateLimit: params.candidateLimit,
+          intent: params.intent,
+          rerank: params.rerank !== false,
+        });
+        const primaryQuery = params.query
+          ?? params.searches.find((search: Record<string, unknown>) => search.type === "lex")?.query
+          ?? params.searches.find((search: Record<string, unknown>) => search.type === "vec")?.query
+          ?? params.searches[0]?.query ?? "";
+        const formatted = results.flatMap(result => {
+          if (!result.externalDocumentId) return [];
+          const { line, snippet } = extractSnippet(result.bestChunk, String(primaryQuery), 300);
+          return [{
+            documentId: result.externalDocumentId,
+            file: result.displayPath,
+            title: result.title,
+            score: Math.round(result.score * 100) / 100,
+            snippet: addLineNumbers(snippet, line),
+          }];
+        });
+        nodeRes.writeHead(200, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ results: formatted }));
+        log(`${ts()} POST /scoped-query ${queries.length} queries (${Date.now() - reqStart}ms)`);
         return;
       }
 
@@ -839,6 +929,12 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
       nodeRes.writeHead(404);
       nodeRes.end("Not Found");
     } catch (err) {
+      if (err instanceof ScopedAuthError) {
+        nodeRes.writeHead(401, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ error: "Unauthorized" }));
+        log(`${ts()} scoped request rejected (${Date.now() - reqStart}ms)`);
+        return;
+      }
       if (err instanceof RequestBodyTooLargeError) {
         nodeRes.writeHead(413, { "Content-Type": "application/json" });
         nodeRes.end(JSON.stringify({ error: "Request body too large" }));

@@ -39,6 +39,7 @@ import {
   dedupeQdrantSearches,
   isQdrantConfigured,
   searchQdrant,
+  type QdrantScope,
   type QdrantSearch,
 } from "./qdrant.js";
 
@@ -3670,6 +3671,7 @@ export interface HybridQueryResult {
   score: number;            // blended score (full precision)
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
+  externalDocumentId?: string; // authoritative application ID (scoped Qdrant only)
   explain?: HybridQueryExplain;
 }
 
@@ -3692,6 +3694,7 @@ async function qdrantQuery(
     skipRerank: boolean;
     hooks?: SearchHooks;
     llm?: LLM;
+    qdrantScope?: QdrantScope;
   },
 ): Promise<HybridQueryResult[]> {
   if (!collections || collections.length === 0) {
@@ -3704,6 +3707,7 @@ async function qdrantQuery(
     candidateLimit: options.candidateLimit,
     llm,
     hooks: options.hooks,
+    scope: options.qdrantScope,
   });
   if (candidates.length === 0) return [];
 
@@ -4225,6 +4229,8 @@ export interface StructuredSearchOptions {
   skipRerank?: boolean;
   hooks?: SearchHooks;
   llm?: LLM;
+  /** Mandatory Qdrant payload ACL. Only trusted server code should set this. */
+  qdrantScope?: QdrantScope;
 }
 
 /**
@@ -4291,6 +4297,7 @@ export async function structuredSearch(
       skipRerank,
       hooks,
       llm: options?.llm,
+      qdrantScope: options?.qdrantScope,
     });
   }
 

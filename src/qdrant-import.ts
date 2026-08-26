@@ -2,7 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { openDatabase, type Database } from "./db.js";
 import { formatDocForEmbedding } from "./llm.js";
 import { getDefaultRemoteLLM } from "./llm-remote.js";
-import { chunkDocument } from "./store.js";
+import { chunkDocument, handelize } from "./store.js";
 import { qdrantDomainForCollection, type QdrantDomain } from "./qdrant.js";
 
 type ImportState = {
@@ -26,6 +26,13 @@ export type QdrantPoint = {
   id: number;
   vector: Record<string, unknown>;
   payload: Record<string, unknown>;
+};
+
+export type QdrantAclPayload = {
+  external_document_id: string;
+  tenant_id: string;
+  scope_keys: string[];
+  access_classes: string[];
 };
 
 const REMOTE_CHUNK_MAX_CHARS = 900 * 3;
@@ -87,7 +94,10 @@ function integerArgument(name: string, fallback: number): number {
 
 function config() {
   const url = (process.env.QMD_QDRANT_URL || process.env.QDRANT_URL || "").replace(/\/$/, "");
-  const apiKey = process.env.QMD_QDRANT_API_KEY || process.env.QDRANT_API_KEY || "";
+  const apiKeyFile = process.env.QMD_QDRANT_API_KEY_FILE?.trim();
+  const apiKey = apiKeyFile
+    ? readFileSync(apiKeyFile, "utf8").trim()
+    : process.env.QMD_QDRANT_API_KEY || process.env.QDRANT_API_KEY || "";
   if (!url || !apiKey) throw new Error("QMD_QDRANT_URL and QMD_QDRANT_API_KEY are required");
   return {
     url,
@@ -240,12 +250,64 @@ function sparse(text: string): Record<string, unknown> {
   };
 }
 
+export function aclPayloadForDocument(
+  document: Pick<DocumentRow, "path">,
+  env: NodeJS.ProcessEnv = process.env,
+): QdrantAclPayload | null {
+  const manifestPath = env.QMD_ACL_MANIFEST?.trim();
+  const required = env.QMD_ACL_MANIFEST_REQUIRED === "1";
+  if (!manifestPath) {
+    if (required) throw new Error("QMD_ACL_MANIFEST is required for this Qdrant importer");
+    return null;
+  }
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+    version?: unknown;
+    documents?: Record<string, {
+      documentId?: unknown;
+      tenant?: unknown;
+      scopes?: unknown;
+      access?: unknown;
+    }>;
+  };
+  if (manifest.version !== 1 || !manifest.documents || typeof manifest.documents !== "object") {
+    throw new Error("QMD ACL manifest must be a version 1 document map");
+  }
+  const normalizedPath = document.path.replace(/^\.\//, "");
+  const matchingEntries = Object.entries(manifest.documents)
+    .filter(([sourcePath]) => handelize(sourcePath) === normalizedPath);
+  if (matchingEntries.length !== 1) {
+    throw new Error(
+      matchingEntries.length === 0
+        ? `QMD ACL manifest has no entry for ${normalizedPath}`
+        : `QMD ACL manifest path is ambiguous for ${normalizedPath}`,
+    );
+  }
+  const entry = matchingEntries[0]![1];
+  const scopes = Array.isArray(entry.scopes) ? entry.scopes : [];
+  const access = Array.isArray(entry.access) ? entry.access : [];
+  if (
+    typeof entry.documentId !== "string" || entry.documentId.length < 1
+    || typeof entry.tenant !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(entry.tenant)
+    || scopes.length < 1 || scopes.some(value => typeof value !== "string" || !/^(project|company|fund|data-room):[^:*?]+$/.test(value))
+    || access.length < 1 || access.some(value => typeof value !== "string" || !["documents", "construction", "money"].includes(value))
+  ) {
+    throw new Error(`QMD ACL manifest entry is invalid for ${normalizedPath}`);
+  }
+  return {
+    external_document_id: entry.documentId,
+    tenant_id: entry.tenant,
+    scope_keys: [...new Set(scopes)] as string[],
+    access_classes: [...new Set(access)] as string[],
+  };
+}
+
 function payload(
   document: DocumentRow,
   seq: number,
   position: number,
   chunkLength: number,
   pointKind: "title" | "chunk",
+  acl: QdrantAclPayload | null,
 ) {
   return {
     document_id: String(document.id),
@@ -259,6 +321,7 @@ function payload(
     position,
     chunk_length: chunkLength,
     point_kind: pointKind,
+    ...(acl ?? {}),
   };
 }
 
@@ -314,6 +377,7 @@ async function embedChunks(
 }
 
 export async function buildQdrantPoints(document: DocumentRow, embedder: Embedder): Promise<QdrantPoint[]> {
+  const acl = aclPayloadForDocument(document);
   const chunks = chunkDocument(
     document.body,
     REMOTE_CHUNK_MAX_CHARS,
@@ -325,7 +389,7 @@ export async function buildQdrantPoints(document: DocumentRow, embedder: Embedde
   const titlePoint: QdrantPoint = {
     id: pointId(document.id, -1),
     vector: { title_bm25: sparse(document.title) },
-    payload: payload(document, -1, 0, 0, "title"),
+    payload: payload(document, -1, 0, 0, "title", acl),
   };
 
   return [titlePoint, ...chunks.map((chunk, seq) => {
@@ -336,7 +400,7 @@ export async function buildQdrantPoints(document: DocumentRow, embedder: Embedde
     return {
       id: pointId(document.id, seq),
       vector,
-      payload: payload(document, seq, chunk.pos, chunk.text.length, "chunk"),
+      payload: payload(document, seq, chunk.pos, chunk.text.length, "chunk", acl),
     };
   })];
 }

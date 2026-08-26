@@ -4,6 +4,10 @@
 
 ### Changes
 
+- Add an authenticated `/scoped-query` endpoint and fail-closed Qdrant payload
+  filters for tenant, authorization scope, and access class.
+- Support an ACL manifest during Qdrant imports so private application document
+  IDs and authorization payloads are attached to every indexed point.
 - Add an optional Qdrant-backed lexical, vector, and hybrid retrieval path with
   explicit collection security domains and a resumable direct-indexing CLI.
 - Support authenticated remote generation without persisting the runtime API

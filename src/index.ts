@@ -63,6 +63,7 @@ import {
   type EmbedProgress,
   type EmbedResult,
 } from "./store.js";
+import type { QdrantScope } from "./qdrant.js";
 import {
   LlamaCpp,
   type LLM,
@@ -164,6 +165,8 @@ export interface SearchOptions {
   candidateLimit?: number;
   /** Include explain traces */
   explain?: boolean;
+  /** Trusted internal Qdrant ACL; not exposed by the general HTTP endpoint. */
+  qdrantScope?: QdrantScope;
 }
 
 /**
@@ -379,6 +382,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       if (!opts.query && !opts.queries) {
         throw new Error("search() requires either 'query' or 'queries'");
       }
+      if (opts.qdrantScope && !opts.queries) {
+        throw new Error("Scoped Qdrant search requires explicit pre-expanded queries");
+      }
       // Normalize collection/collections
       const collections = [
         ...(opts.collection ? [opts.collection] : []),
@@ -396,6 +402,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           explain: opts.explain,
           intent: opts.intent,
           skipRerank,
+          qdrantScope: opts.qdrantScope,
         });
       }
 

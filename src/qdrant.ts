@@ -1,5 +1,6 @@
 import type { Database } from "./db.js";
 import { formatQueryForEmbedding, type LLM } from "./llm.js";
+import { readFileSync } from "node:fs";
 
 export type QdrantDomain = "public" | "shape";
 
@@ -13,10 +14,17 @@ export type QdrantSearchOptions = {
   limit: number;
   candidateLimit?: number;
   llm: LLM;
+  scope?: QdrantScope;
   hooks?: {
     onEmbedStart?: (count: number) => void;
     onEmbedDone?: (durationMs: number) => void;
   };
+};
+
+export type QdrantScope = {
+  tenant: string;
+  scopes: string[];
+  access: string[];
 };
 
 export type QdrantDocumentResult = {
@@ -29,6 +37,7 @@ export type QdrantDocumentResult = {
   score: number;
   docid: string;
   collectionName: string;
+  externalDocumentId?: string;
 };
 
 export type QdrantLexQuery = {
@@ -71,6 +80,7 @@ export function qdrantDomainForCollection(collection: string): QdrantDomain {
     || collection.startsWith("email-")
     || collection.startsWith("gdrive_")
     || collection.startsWith("gdrive-")
+    || collection.startsWith("rooms-")
   ) {
     return "shape";
   }
@@ -110,7 +120,10 @@ export function dedupeQdrantSearches(searches: QdrantSearch[]): QdrantSearch[] {
 
 function loadQdrantConfig(): QdrantConfig {
   const url = (process.env.QMD_QDRANT_URL || process.env.QDRANT_URL || "").replace(/\/$/, "");
-  const apiKey = process.env.QMD_QDRANT_API_KEY || process.env.QDRANT_API_KEY || "";
+  const apiKeyFile = process.env.QMD_QDRANT_API_KEY_FILE?.trim();
+  const apiKey = apiKeyFile
+    ? readFileSync(apiKeyFile, "utf8").trim()
+    : process.env.QMD_QDRANT_API_KEY || process.env.QDRANT_API_KEY || "";
   if (!url) throw new Error("QMD_QDRANT_URL is required for the Qdrant backend");
   if (!apiKey) throw new Error("QMD_QDRANT_API_KEY is required for the Qdrant backend");
 
@@ -155,10 +168,24 @@ async function qdrantRequest<T>(config: QdrantConfig, path: string, body: unknow
   return response.json() as Promise<T>;
 }
 
-function collectionFilter(collections: string[]): Record<string, unknown> {
-  return {
-    must: [{ key: "source_collection", match: { any: collections } }],
-  };
+export function qdrantSearchFilter(
+  collections: string[],
+  scope?: QdrantScope,
+): Record<string, unknown> {
+  const must: Record<string, unknown>[] = [
+    { key: "source_collection", match: { any: collections } },
+  ];
+  if (scope) {
+    if (!scope.tenant || scope.scopes.length === 0 || scope.access.length === 0) {
+      throw new Error("Scoped Qdrant search requires tenant, scopes, and access claims");
+    }
+    must.push(
+      { key: "tenant_id", match: { value: scope.tenant } },
+      { key: "scope_keys", match: { any: scope.scopes } },
+      { key: "access_classes", match: { any: scope.access } },
+    );
+  }
+  return { must };
 }
 
 function bodyPointQuery(
@@ -260,8 +287,9 @@ async function queryDomain(
   embeddings: Array<number[] | null>,
   collections: string[],
   limit: number,
+  scope?: QdrantScope,
 ): Promise<QdrantPoint[]> {
-  const filter = collectionFilter(collections);
+  const filter = qdrantSearchFilter(collections, scope);
   // Grouping happens after prefetch, so fetch more chunks than the requested
   // number of document groups. Strict mode caps every query stage at 100.
   const prefetchLimit = Math.min(100, Math.max(40, limit * 2));
@@ -339,6 +367,9 @@ function hydratePoints(
       score: Math.max(0, Math.min(1, point.score)),
       docid: row.hash.slice(0, 6),
       collectionName: row.collection,
+      ...(typeof point.payload?.external_document_id === "string"
+        ? { externalDocumentId: point.payload.external_document_id }
+        : {}),
     });
     if (results.length >= limit) break;
   }
@@ -393,6 +424,7 @@ export async function searchQdrant(
         embeddings,
         grouped[domain],
         candidateLimit,
+        options.scope,
       )),
   );
 
