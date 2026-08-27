@@ -359,6 +359,7 @@ describe("lex query syntax", () => {
     test("accepts plain natural language", () => {
       expect(validateSemanticQuery("how does error handling work")).toBeNull();
       expect(validateSemanticQuery("what is the CAP theorem")).toBeNull();
+      expect(validateSemanticQuery("site-specific non-performing loan geography")).toBeNull();
     });
 
     test("rejects negation syntax", () => {

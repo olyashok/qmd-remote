@@ -2709,8 +2709,11 @@ function buildFTS5Query(query: string): string | null {
  * Returns error message if invalid, null if valid.
  */
 export function validateSemanticQuery(query: string): string | null {
-  // Check for negation syntax
-  if (/-\w/.test(query) || /-"/.test(query)) {
+  // A leading '-' is lexical negation only at a token boundary. Hyphenated
+  // natural-language terms (for example "non-performing" or "site-specific")
+  // are valid semantic text and must not make LLM-generated vec/hyde searches
+  // fail the entire request.
+  if (/(?:^|\s)-(?:\w|")/.test(query)) {
     return 'Negation (-term) is not supported in vec/hyde queries. Use lex for exclusions.';
   }
   return null;
